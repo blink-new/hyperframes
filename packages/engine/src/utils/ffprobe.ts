@@ -42,6 +42,15 @@ function parseProbeJson(stdout: string): FFProbeOutput {
 const videoMetadataCache = new Map<string, Promise<VideoMetadata>>();
 const audioMetadataCache = new Map<string, Promise<AudioMetadata>>();
 
+export interface VideoColorSpace {
+  /** Color transfer characteristics, e.g. "bt709", "smpte2084", "arib-std-b67" */
+  colorTransfer: string;
+  /** Color primaries, e.g. "bt709", "bt2020" */
+  colorPrimaries: string;
+  /** Color matrix/space, e.g. "bt709", "bt2020nc" */
+  colorSpace: string;
+}
+
 export interface VideoMetadata {
   durationSeconds: number;
   width: number;
@@ -51,6 +60,8 @@ export interface VideoMetadata {
   hasAudio: boolean;
   /** True when r_frame_rate and avg_frame_rate differ significantly (>10%), indicating variable frame rate. */
   isVFR: boolean;
+  /** Color space info from the video stream. Null if ffprobe didn't report it. */
+  colorSpace: VideoColorSpace | null;
 }
 
 export interface AudioMetadata {
@@ -70,6 +81,9 @@ interface FFProbeStream {
   avg_frame_rate?: string;
   sample_rate?: string;
   channels?: number;
+  color_transfer?: string;
+  color_primaries?: string;
+  color_space?: string;
 }
 
 interface FFProbeFormat {
@@ -117,6 +131,11 @@ export async function extractVideoMetadata(filePath: string): Promise<VideoMetad
     // VFR: r_frame_rate (max/nominal) differs from avg_frame_rate (actual average) by >10%
     const isVFR = rFps > 0 && avgFps > 0 && Math.abs(rFps - avgFps) / Math.max(rFps, avgFps) > 0.1;
 
+    const colorTransfer = videoStream.color_transfer || "";
+    const colorPrimaries = videoStream.color_primaries || "";
+    const colorSpaceVal = videoStream.color_space || "";
+    const hasColorInfo = !!(colorTransfer || colorPrimaries || colorSpaceVal);
+
     return {
       durationSeconds: output.format.duration ? parseFloat(output.format.duration) : 0,
       width: videoStream.width || 0,
@@ -125,6 +144,9 @@ export async function extractVideoMetadata(filePath: string): Promise<VideoMetad
       videoCodec: videoStream.codec_name || "unknown",
       hasAudio: output.streams.some((s) => s.codec_type === "audio"),
       isVFR,
+      colorSpace: hasColorInfo
+        ? { colorTransfer, colorPrimaries, colorSpace: colorSpaceVal }
+        : null,
     };
   })();
 

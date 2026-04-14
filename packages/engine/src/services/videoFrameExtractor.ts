@@ -9,8 +9,13 @@ import { spawn } from "child_process";
 import { existsSync, mkdirSync, readdirSync, rmSync } from "fs";
 import { join } from "path";
 import { parseHTML } from "linkedom";
-import { extractVideoMetadata, type VideoMetadata } from "../utils/ffprobe.js";
+import {
+  extractVideoMetadata,
+  type VideoMetadata,
+  type VideoColorSpace,
+} from "../utils/ffprobe.js";
 import { downloadToTemp, isHttpUrl } from "../utils/urlDownloader.js";
+import { runFfmpeg } from "../utils/runFfmpeg.js";
 import { DEFAULT_CONFIG, type EngineConfig } from "../config.js";
 
 export interface VideoElement {
@@ -195,6 +200,70 @@ export async function extractVideoFramesRange(
   });
 }
 
+/**
+ * Check if a video's color space indicates HDR content (BT.2020 primaries/matrix/transfer).
+ */
+export function isHdrColorSpace(cs: VideoColorSpace | null): boolean {
+  if (!cs) return false;
+  return (
+    cs.colorPrimaries.includes("bt2020") ||
+    cs.colorSpace.includes("bt2020") ||
+    cs.colorTransfer === "smpte2084" ||
+    cs.colorTransfer === "arib-std-b67"
+  );
+}
+
+/**
+ * Convert an SDR video to HDR color space (HLG / BT.2020) so it can be
+ * composited alongside HDR content without looking washed out.
+ *
+ * Uses zscale for color space conversion with a nominal peak luminance of
+ * 600 nits — high enough that SDR content doesn't appear too dark next to
+ * HDR, matching the approach used by HeyGen's Rio pipeline.
+ */
+async function convertSdrToHdr(
+  inputPath: string,
+  outputPath: string,
+  inputColorSpace: VideoColorSpace | null,
+  signal?: AbortSignal,
+  config?: Partial<Pick<EngineConfig, "ffmpegProcessTimeout">>,
+): Promise<void> {
+  const timeout = config?.ffmpegProcessTimeout ?? DEFAULT_CONFIG.ffmpegProcessTimeout;
+  const tin = inputColorSpace?.colorTransfer || "bt709";
+  const min = inputColorSpace?.colorSpace || "bt709";
+  const pin = inputColorSpace?.colorPrimaries || "bt709";
+
+  const args = [
+    "-i",
+    inputPath,
+    "-vf",
+    `zscale=tin=${tin}:min=${min}:pin=${pin}:t=arib-std-b67:m=bt2020nc:p=bt2020:r=tv:npl=600`,
+    "-color_primaries",
+    "bt2020",
+    "-color_trc",
+    "arib-std-b67",
+    "-colorspace",
+    "bt2020nc",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "fast",
+    "-crf",
+    "16",
+    "-c:a",
+    "copy",
+    "-y",
+    outputPath,
+  ];
+
+  const result = await runFfmpeg(args, { signal, timeout });
+  if (!result.success) {
+    throw new Error(
+      `SDR→HDR conversion failed (exit ${result.exitCode}): ${result.stderr.slice(-300)}`,
+    );
+  }
+}
+
 export async function extractAllVideoFrames(
   videos: VideoElement[],
   baseDir: string,
@@ -208,30 +277,75 @@ export async function extractAllVideoFrames(
   const errors: Array<{ videoId: string; error: string }> = [];
   let totalFramesExtracted = 0;
 
-  // Process videos in parallel for better performance
+  // Phase 1: Resolve paths and download remote videos
+  const resolvedVideos: Array<{ video: VideoElement; videoPath: string }> = [];
+  for (const video of videos) {
+    if (signal?.aborted) break;
+    try {
+      let videoPath = video.src;
+      if (!videoPath.startsWith("/") && !isHttpUrl(videoPath)) {
+        const fromCompiled = compiledDir ? join(compiledDir, videoPath) : null;
+        videoPath =
+          fromCompiled && existsSync(fromCompiled) ? fromCompiled : join(baseDir, videoPath);
+      }
+
+      if (isHttpUrl(videoPath)) {
+        const downloadDir = join(options.outputDir, "_downloads");
+        mkdirSync(downloadDir, { recursive: true });
+        videoPath = await downloadToTemp(videoPath, downloadDir);
+      }
+
+      if (!existsSync(videoPath)) {
+        errors.push({ videoId: video.id, error: `Video file not found: ${videoPath}` });
+        continue;
+      }
+      resolvedVideos.push({ video, videoPath });
+    } catch (err) {
+      errors.push({ videoId: video.id, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  // Phase 2: Probe color spaces and normalize if mixed HDR/SDR
+  const videoColorSpaces = await Promise.all(
+    resolvedVideos.map(async ({ videoPath }) => {
+      const metadata = await extractVideoMetadata(videoPath);
+      return metadata.colorSpace;
+    }),
+  );
+
+  const hasAnyHdr = videoColorSpaces.some(isHdrColorSpace);
+  if (hasAnyHdr) {
+    const convertDir = join(options.outputDir, "_hdr_normalized");
+    mkdirSync(convertDir, { recursive: true });
+
+    for (let i = 0; i < resolvedVideos.length; i++) {
+      if (signal?.aborted) break;
+      const cs = videoColorSpaces[i] ?? null;
+      if (!isHdrColorSpace(cs)) {
+        // SDR video in a mixed timeline — convert to HDR color space
+        const entry = resolvedVideos[i];
+        if (!entry) continue;
+        const convertedPath = join(convertDir, `${entry.video.id}_hdr.mp4`);
+        try {
+          await convertSdrToHdr(entry.videoPath, convertedPath, cs, signal, config);
+          entry.videoPath = convertedPath;
+        } catch (err) {
+          errors.push({
+            videoId: entry.video.id,
+            error: `SDR→HDR conversion failed: ${err instanceof Error ? err.message : String(err)}`,
+          });
+        }
+      }
+    }
+  }
+
+  // Phase 3: Extract frames (parallel)
   const results = await Promise.all(
-    videos.map(async (video) => {
+    resolvedVideos.map(async ({ video, videoPath }) => {
       if (signal?.aborted) {
         throw new Error("Video frame extraction cancelled");
       }
       try {
-        let videoPath = video.src;
-        if (!videoPath.startsWith("/") && !isHttpUrl(videoPath)) {
-          const fromCompiled = compiledDir ? join(compiledDir, videoPath) : null;
-          videoPath =
-            fromCompiled && existsSync(fromCompiled) ? fromCompiled : join(baseDir, videoPath);
-        }
-
-        if (isHttpUrl(videoPath)) {
-          const downloadDir = join(options.outputDir, "_downloads");
-          mkdirSync(downloadDir, { recursive: true });
-          videoPath = await downloadToTemp(videoPath, downloadDir);
-        }
-
-        if (!existsSync(videoPath)) {
-          return { error: { videoId: video.id, error: `Video file not found: ${videoPath}` } };
-        }
-
         let videoDuration = video.end - video.start;
 
         // Fallback: if no data-duration/data-end was specified (end is Infinity or 0),
