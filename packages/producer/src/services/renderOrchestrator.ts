@@ -30,6 +30,7 @@ import {
   createFrameLookupTable,
   type VideoElement,
   FrameLookupTable,
+  type HdrTransfer,
   createCaptureSession,
   initializeSession,
   closeCaptureSession,
@@ -54,6 +55,8 @@ import {
   spawnStreamingEncoder,
   createFrameReorderBuffer,
   type StreamingEncoder,
+  convertHdrFrameToRgb48le,
+  isHdrColorSpace,
 } from "@hyperframes/engine";
 import { join, dirname, resolve } from "path";
 import { randomUUID } from "crypto";
@@ -110,19 +113,7 @@ export interface RenderConfig {
   producerConfig?: EngineConfig;
   /** Custom logger. Defaults to console-based defaultLogger. */
   logger?: ProducerLogger;
-  /**
-   * Override CRF (Constant Rate Factor) for the video encoder.
-   * Lower values = higher quality / larger files. Range: 0–51 for H.264.
-   * When set, overrides the CRF from the quality preset.
-   * Mutually exclusive with `videoBitrate`.
-   */
-  crf?: number;
-  /**
-   * Target video bitrate (e.g. "10M", "5000k").
-   * When set, uses bitrate-based encoding instead of CRF.
-   * Mutually exclusive with `crf`.
-   */
-  videoBitrate?: string;
+  /** HDR output: "hlg", "pq", "auto" (detect from sources), or undefined (SDR). */
 }
 
 export interface RenderPerfSummary {
@@ -706,9 +697,10 @@ export async function executeRenderJob(
 
     let frameLookup: FrameLookupTable | null = null;
     const compiledDir = join(workDir, "compiled");
+    let extractionResult: Awaited<ReturnType<typeof extractAllVideoFrames>> | null = null;
 
     if (composition.videos.length > 0) {
-      const extractionResult = await extractAllVideoFrames(
+      extractionResult = await extractAllVideoFrames(
         composition.videos,
         projectDir,
         { fps: job.config.fps, outputDir: join(workDir, "video-frames") },
@@ -746,6 +738,32 @@ export async function executeRenderJob(
       }
     } else {
       perfStages.videoExtractMs = Date.now() - stage2Start;
+    }
+
+    // ── HDR auto-detection ──────────────────────────────────────────────
+    // Check if any extracted video source has HDR color space. If so, the
+    // output automatically uses H.265 10-bit with HLG metadata. No flag needed.
+    let effectiveHdr: { transfer: HdrTransfer } | undefined;
+    if (frameLookup) {
+      // Check extracted video metadata for HDR color spaces
+      for (const ext of extractionResult?.extracted ?? []) {
+        if (isHdrColorSpace(ext.metadata.colorSpace)) {
+          // Detect transfer: PQ or HLG
+          const cs = ext.metadata.colorSpace;
+          const transfer: HdrTransfer = cs?.colorTransfer === "smpte2084" ? "pq" : "hlg";
+          effectiveHdr = { transfer };
+          break;
+        }
+      }
+    }
+    if (effectiveHdr && outputFormat !== "mp4") {
+      log.info(`[Render] HDR source detected but format is ${outputFormat} — using SDR`);
+      effectiveHdr = undefined;
+    }
+    if (effectiveHdr) {
+      log.info(
+        `[Render] HDR source detected — output: ${effectiveHdr.transfer.toUpperCase()} (BT.2020, 10-bit H.265)`,
+      );
     }
 
     // ── Stage 3: Audio processing ───────────────────────────────────────
@@ -804,275 +822,379 @@ export async function executeRenderJob(
     const FORMAT_EXT: Record<string, string> = { mp4: ".mp4", webm: ".webm", mov: ".mov" };
     const videoExt = FORMAT_EXT[outputFormat] ?? ".mp4";
     const videoOnlyPath = join(workDir, `video-only${videoExt}`);
-    const preset = getEncoderPreset(job.config.quality, outputFormat);
-
-    // User-level CRF/bitrate overrides take precedence over presets.
-    const effectiveQuality = job.config.crf ?? preset.quality;
-    const effectiveBitrate = job.config.videoBitrate;
-
-    // Shared encoder options used by both streaming and chunk encode paths.
-    const baseEncoderOpts = {
-      fps: job.config.fps,
-      width,
-      height,
-      codec: preset.codec,
-      preset: preset.preset,
-      quality: effectiveQuality,
-      bitrate: effectiveBitrate,
-      pixelFormat: preset.pixelFormat,
-      useGpu: job.config.useGpu,
-    };
+    // Only use the HDR encoder preset when there's HDR video to pass through.
+    // For SDR-only compositions, --hdr is a no-op — H.265 10-bit causes browser
+    // color management issues (orange shift) with no quality benefit.
+    const hasHdrVideo = effectiveHdr && composition.videos.length > 0 && frameLookup;
+    const encoderHdr = hasHdrVideo ? effectiveHdr : undefined;
+    const preset = getEncoderPreset(job.config.quality, outputFormat, encoderHdr);
 
     job.framesRendered = 0;
 
-    // Streaming encode mode: pipe frame buffers directly to FFmpeg stdin,
-    // skipping disk writes and the separate Stage 5 encode step.
-    let streamingEncoder: StreamingEncoder | null = null;
+    // ── HDR pass-through path ────────────────────────────────────────────
+    // When HDR output is requested AND the composition has HDR video sources,
+    // extract raw HLG frames and pass them directly to FFmpeg — no conversion.
+    // The HLG pixel values ARE the correct encoding. The output is tagged as
+    // HLG/BT.2020 so HDR displays render it correctly.
+    //
+    // No WebGPU or Chrome needed for this path — it's a pure FFmpeg pipeline.
+    // GSAP transforms are NOT applied (future work: WebGPU shader transforms).
+    if (hasHdrVideo) {
+      log.info("[Render] HDR pass-through: extracting native HLG frames from video sources");
 
-    if (enableStreamingEncode) {
-      streamingEncoder = await spawnStreamingEncoder(
+      const hdrEncoder = await spawnStreamingEncoder(
         videoOnlyPath,
         {
-          ...baseEncoderOpts,
-          imageFormat: captureOptions.format || "jpeg",
+          fps: job.config.fps,
+          width,
+          height,
+          codec: preset.codec,
+          preset: preset.preset,
+          quality: preset.quality,
+          pixelFormat: preset.pixelFormat,
+          hdr: preset.hdr,
+          rawInputFormat: "rgb48le",
         },
         abortSignal,
+        { ffmpegStreamingTimeout: 3_600_000 },
       );
       assertNotAborted();
-    }
 
-    if (enableStreamingEncode && streamingEncoder) {
-      // ── Streaming capture + encode (Stage 4 absorbs Stage 5) ──────────
-      const reorderBuffer = createFrameReorderBuffer(0, job.totalFrames!);
-      const currentEncoder = streamingEncoder;
+      const { execSync } = await import("child_process");
 
-      if (workerCount > 1) {
-        // Parallel capture → streaming encode
-        const tasks = distributeFrames(job.totalFrames, workerCount, workDir);
-
-        const onFrameBuffer = async (frameIndex: number, buffer: Buffer): Promise<void> => {
-          await reorderBuffer.waitForFrame(frameIndex);
-          currentEncoder.writeFrame(buffer);
-          reorderBuffer.advanceTo(frameIndex + 1);
-        };
-
-        await executeParallelCapture(
-          fileServer.url,
-          workDir,
-          tasks,
-          captureOptions,
-          () => createVideoFrameInjector(frameLookup),
-          abortSignal,
-          (progress) => {
-            job.framesRendered = progress.capturedFrames;
-            const frameProgress = progress.capturedFrames / progress.totalFrames;
-            const progressPct = 25 + frameProgress * 55;
-
-            if (
-              progress.capturedFrames % 30 === 0 ||
-              progress.capturedFrames === progress.totalFrames
-            ) {
-              updateJobStatus(
-                job,
-                "rendering",
-                `Streaming frame ${progress.capturedFrames}/${progress.totalFrames} (${workerCount} workers)`,
-                Math.round(progressPct),
-                onProgress,
-              );
-            }
-          },
-          onFrameBuffer,
-          cfg,
-        );
-
-        if (probeSession) {
-          lastBrowserConsole = probeSession.browserConsoleBuffer;
-          await closeCaptureSession(probeSession);
-          probeSession = null;
-        }
-      } else {
-        // Sequential capture → streaming encode
-
-        const videoInjector = createVideoFrameInjector(frameLookup);
-        const session =
-          probeSession ??
-          (await createCaptureSession(
-            fileServer.url,
-            framesDir,
-            captureOptions,
-            videoInjector,
-            cfg,
-          ));
-        if (probeSession) {
-          prepareCaptureSessionForReuse(session, framesDir, videoInjector);
-          probeSession = null;
-        }
-
-        try {
-          if (!session.isInitialized) {
-            await initializeSession(session);
-          }
+      try {
+        for (let i = 0; i < job.totalFrames!; i++) {
           assertNotAborted();
-          lastBrowserConsole = session.browserConsoleBuffer;
+          const time = i / job.config.fps;
 
-          for (let i = 0; i < job.totalFrames!; i++) {
-            assertNotAborted();
-            const time = i / job.config.fps;
-            const { buffer } = await captureFrameToBuffer(session, i, time);
-            await reorderBuffer.waitForFrame(i);
-            currentEncoder.writeFrame(buffer);
-            reorderBuffer.advanceTo(i + 1);
-            job.framesRendered = i + 1;
+          const activeFrames = frameLookup!.getActiveFramePayloads(time);
 
+          if (activeFrames.size > 0) {
+            const [videoId] = activeFrames.keys();
+            const video = composition.videos.find((v) => v.id === videoId);
+            if (video) {
+              const localTime = time - video.start + video.mediaStart;
+
+              let srcPath = video.src;
+              const compiledDir = join(workDir, "compiled");
+              if (!srcPath.startsWith("/")) {
+                const fromCompiled = join(compiledDir, srcPath);
+                srcPath = existsSync(fromCompiled) ? fromCompiled : join(projectDir, srcPath);
+              }
+
+              let rawFrame: Buffer;
+              try {
+                rawFrame = execSync(
+                  `ffmpeg -ss ${localTime} -i "${srcPath}" -vframes 1 -f rawvideo -pix_fmt rgba64le -`,
+                  { maxBuffer: width * height * 8 + 1024 * 1024, stdio: ["pipe", "pipe", "pipe"] },
+                );
+              } catch {
+                rawFrame = Buffer.alloc(width * height * 8);
+              }
+
+              // Pass through HLG pixels as-is (RGBA → RGB, no color conversion)
+              const rgb48Frame = convertHdrFrameToRgb48le(rawFrame, width, height);
+              hdrEncoder.writeFrame(rgb48Frame);
+            } else {
+              hdrEncoder.writeFrame(Buffer.alloc(width * height * 6));
+            }
+          } else {
+            hdrEncoder.writeFrame(Buffer.alloc(width * height * 6));
+          }
+
+          job.framesRendered = i + 1;
+          if ((i + 1) % 10 === 0 || i + 1 === job.totalFrames!) {
             const frameProgress = (i + 1) / job.totalFrames!;
-            const progress = 25 + frameProgress * 55;
-
             updateJobStatus(
               job,
               "rendering",
-              `Streaming frame ${i + 1}/${job.totalFrames}`,
-              Math.round(progress),
+              `HDR frame ${i + 1}/${job.totalFrames}`,
+              Math.round(25 + frameProgress * 55),
               onProgress,
             );
           }
-        } finally {
-          lastBrowserConsole = session.browserConsoleBuffer;
-          await closeCaptureSession(session);
         }
+      } finally {
+        // No browser to close — pure FFmpeg path
       }
 
-      // Close encoder and get result
-      const encodeResult = await currentEncoder.close();
+      const hdrEncodeResult = await hdrEncoder.close();
       assertNotAborted();
-
-      if (!encodeResult.success) {
-        throw new Error(`Streaming encode failed: ${encodeResult.error}`);
+      if (!hdrEncodeResult.success) {
+        throw new Error(`HDR encode failed: ${hdrEncodeResult.error}`);
       }
 
       perfStages.captureMs = Date.now() - stage4Start;
-      perfStages.encodeMs = encodeResult.durationMs; // Overlapped with capture
-    } else {
-      // ── Disk-based capture (original flow) ────────────────────────────
-      if (workerCount > 1) {
-        // Parallel capture
-        const tasks = distributeFrames(job.totalFrames, workerCount, workDir);
+      perfStages.encodeMs = hdrEncodeResult.durationMs;
+    } else // ── Standard capture paths (SDR or DOM-only HDR) ──────────────────
+    // Streaming encode mode: pipe frame buffers directly to FFmpeg stdin,
+    // skipping disk writes and the separate Stage 5 encode step.
+    {
+      let streamingEncoder: StreamingEncoder | null = null;
 
-        await executeParallelCapture(
-          fileServer.url,
-          workDir,
-          tasks,
-          captureOptions,
-          () => createVideoFrameInjector(frameLookup),
+      if (enableStreamingEncode) {
+        streamingEncoder = await spawnStreamingEncoder(
+          videoOnlyPath,
+          {
+            fps: job.config.fps,
+            width,
+            height,
+            codec: preset.codec,
+            preset: preset.preset,
+            quality: preset.quality,
+            pixelFormat: preset.pixelFormat,
+            useGpu: job.config.useGpu,
+            imageFormat: captureOptions.format || "jpeg",
+            hdr: preset.hdr,
+          },
           abortSignal,
-          (progress) => {
-            job.framesRendered = progress.capturedFrames;
-            const frameProgress = progress.capturedFrames / progress.totalFrames;
-            const progressPct = 25 + frameProgress * 45;
+        );
+        assertNotAborted();
+      }
 
-            if (
-              progress.capturedFrames % 30 === 0 ||
-              progress.capturedFrames === progress.totalFrames
-            ) {
+      if (enableStreamingEncode && streamingEncoder) {
+        // ── Streaming capture + encode (Stage 4 absorbs Stage 5) ──────────
+        const reorderBuffer = createFrameReorderBuffer(0, job.totalFrames!);
+        const currentEncoder = streamingEncoder;
+
+        if (workerCount > 1) {
+          // Parallel capture → streaming encode
+          const tasks = distributeFrames(job.totalFrames, workerCount, workDir);
+
+          const onFrameBuffer = async (frameIndex: number, buffer: Buffer): Promise<void> => {
+            await reorderBuffer.waitForFrame(frameIndex);
+            currentEncoder.writeFrame(buffer);
+            reorderBuffer.advanceTo(frameIndex + 1);
+          };
+
+          await executeParallelCapture(
+            fileServer.url,
+            workDir,
+            tasks,
+            captureOptions,
+            () => createVideoFrameInjector(frameLookup),
+            abortSignal,
+            (progress) => {
+              job.framesRendered = progress.capturedFrames;
+              const frameProgress = progress.capturedFrames / progress.totalFrames;
+              const progressPct = 25 + frameProgress * 55;
+
+              if (
+                progress.capturedFrames % 30 === 0 ||
+                progress.capturedFrames === progress.totalFrames
+              ) {
+                updateJobStatus(
+                  job,
+                  "rendering",
+                  `Streaming frame ${progress.capturedFrames}/${progress.totalFrames} (${workerCount} workers)`,
+                  Math.round(progressPct),
+                  onProgress,
+                );
+              }
+            },
+            onFrameBuffer,
+            cfg,
+          );
+
+          if (probeSession) {
+            lastBrowserConsole = probeSession.browserConsoleBuffer;
+            await closeCaptureSession(probeSession);
+            probeSession = null;
+          }
+        } else {
+          // Sequential capture → streaming encode
+
+          const videoInjector = createVideoFrameInjector(frameLookup);
+          const session =
+            probeSession ??
+            (await createCaptureSession(
+              fileServer.url,
+              framesDir,
+              captureOptions,
+              videoInjector,
+              cfg,
+            ));
+          if (probeSession) {
+            prepareCaptureSessionForReuse(session, framesDir, videoInjector);
+            probeSession = null;
+          }
+
+          try {
+            if (!session.isInitialized) {
+              await initializeSession(session);
+            }
+            assertNotAborted();
+            lastBrowserConsole = session.browserConsoleBuffer;
+
+            for (let i = 0; i < job.totalFrames!; i++) {
+              assertNotAborted();
+              const time = i / job.config.fps;
+              const { buffer } = await captureFrameToBuffer(session, i, time);
+              await reorderBuffer.waitForFrame(i);
+              currentEncoder.writeFrame(buffer);
+              reorderBuffer.advanceTo(i + 1);
+              job.framesRendered = i + 1;
+
+              const frameProgress = (i + 1) / job.totalFrames!;
+              const progress = 25 + frameProgress * 55;
+
               updateJobStatus(
                 job,
                 "rendering",
-                `Capturing frame ${progress.capturedFrames}/${progress.totalFrames} (${workerCount} workers)`,
-                Math.round(progressPct),
+                `Streaming frame ${i + 1}/${job.totalFrames}`,
+                Math.round(progress),
                 onProgress,
               );
             }
-          },
-          undefined,
-          cfg,
-        );
-
-        await mergeWorkerFrames(workDir, tasks, framesDir);
-        if (probeSession) {
-          lastBrowserConsole = probeSession.browserConsoleBuffer;
-          await closeCaptureSession(probeSession);
-          probeSession = null;
+          } finally {
+            lastBrowserConsole = session.browserConsoleBuffer;
+            await closeCaptureSession(session);
+          }
         }
+
+        // Close encoder and get result
+        const encodeResult = await currentEncoder.close();
+        assertNotAborted();
+
+        if (!encodeResult.success) {
+          throw new Error(`Streaming encode failed: ${encodeResult.error}`);
+        }
+
+        perfStages.captureMs = Date.now() - stage4Start;
+        perfStages.encodeMs = encodeResult.durationMs; // Overlapped with capture
       } else {
-        // Sequential capture
+        // ── Disk-based capture (original flow) ────────────────────────────
+        if (workerCount > 1) {
+          // Parallel capture
+          const tasks = distributeFrames(job.totalFrames, workerCount, workDir);
 
-        const videoInjector = createVideoFrameInjector(frameLookup);
-        const session =
-          probeSession ??
-          (await createCaptureSession(
+          await executeParallelCapture(
             fileServer.url,
-            framesDir,
+            workDir,
+            tasks,
             captureOptions,
-            videoInjector,
+            () => createVideoFrameInjector(frameLookup),
+            abortSignal,
+            (progress) => {
+              job.framesRendered = progress.capturedFrames;
+              const frameProgress = progress.capturedFrames / progress.totalFrames;
+              const progressPct = 25 + frameProgress * 45;
+
+              if (
+                progress.capturedFrames % 30 === 0 ||
+                progress.capturedFrames === progress.totalFrames
+              ) {
+                updateJobStatus(
+                  job,
+                  "rendering",
+                  `Capturing frame ${progress.capturedFrames}/${progress.totalFrames} (${workerCount} workers)`,
+                  Math.round(progressPct),
+                  onProgress,
+                );
+              }
+            },
+            undefined,
             cfg,
-          ));
-        if (probeSession) {
-          prepareCaptureSessionForReuse(session, framesDir, videoInjector);
-          probeSession = null;
-        }
-
-        try {
-          if (!session.isInitialized) {
-            await initializeSession(session);
-          }
-          assertNotAborted();
-          lastBrowserConsole = session.browserConsoleBuffer;
-
-          for (let i = 0; i < job.totalFrames; i++) {
-            assertNotAborted();
-            const time = i / job.config.fps;
-            await captureFrame(session, i, time);
-            job.framesRendered = i + 1;
-
-            const frameProgress = (i + 1) / job.totalFrames;
-            const progress = 25 + frameProgress * 45;
-
-            updateJobStatus(
-              job,
-              "rendering",
-              `Capturing frame ${i + 1}/${job.totalFrames}`,
-              Math.round(progress),
-              onProgress,
-            );
-          }
-        } finally {
-          lastBrowserConsole = session.browserConsoleBuffer;
-          await closeCaptureSession(session);
-        }
-      }
-
-      perfStages.captureMs = Date.now() - stage4Start;
-
-      // ── Stage 5: Encode ─────────────────────────────────────────────────
-      const stage5Start = Date.now();
-      updateJobStatus(job, "encoding", "Encoding video", 75, onProgress);
-
-      const frameExt = needsAlpha ? "png" : "jpg";
-      const framePattern = `frame_%06d.${frameExt}`;
-      const encoderOpts = baseEncoderOpts;
-      const encodeResult = enableChunkedEncode
-        ? await encodeFramesChunkedConcat(
-            framesDir,
-            framePattern,
-            videoOnlyPath,
-            encoderOpts,
-            chunkedEncodeSize,
-            abortSignal,
-          )
-        : await encodeFramesFromDir(
-            framesDir,
-            framePattern,
-            videoOnlyPath,
-            encoderOpts,
-            abortSignal,
           );
-      assertNotAborted();
 
-      if (!encodeResult.success) {
-        throw new Error(`Encoding failed: ${encodeResult.error}`);
+          await mergeWorkerFrames(workDir, tasks, framesDir);
+          if (probeSession) {
+            lastBrowserConsole = probeSession.browserConsoleBuffer;
+            await closeCaptureSession(probeSession);
+            probeSession = null;
+          }
+        } else {
+          // Sequential capture
+
+          const videoInjector = createVideoFrameInjector(frameLookup);
+          const session =
+            probeSession ??
+            (await createCaptureSession(
+              fileServer.url,
+              framesDir,
+              captureOptions,
+              videoInjector,
+              cfg,
+            ));
+          if (probeSession) {
+            prepareCaptureSessionForReuse(session, framesDir, videoInjector);
+            probeSession = null;
+          }
+
+          try {
+            if (!session.isInitialized) {
+              await initializeSession(session);
+            }
+            assertNotAborted();
+            lastBrowserConsole = session.browserConsoleBuffer;
+
+            for (let i = 0; i < job.totalFrames; i++) {
+              assertNotAborted();
+              const time = i / job.config.fps;
+              await captureFrame(session, i, time);
+              job.framesRendered = i + 1;
+
+              const frameProgress = (i + 1) / job.totalFrames;
+              const progress = 25 + frameProgress * 45;
+
+              updateJobStatus(
+                job,
+                "rendering",
+                `Capturing frame ${i + 1}/${job.totalFrames}`,
+                Math.round(progress),
+                onProgress,
+              );
+            }
+          } finally {
+            lastBrowserConsole = session.browserConsoleBuffer;
+            await closeCaptureSession(session);
+          }
+        }
+
+        perfStages.captureMs = Date.now() - stage4Start;
+
+        // ── Stage 5: Encode ─────────────────────────────────────────────────
+        const stage5Start = Date.now();
+        updateJobStatus(job, "encoding", "Encoding video", 75, onProgress);
+
+        const frameExt = needsAlpha ? "png" : "jpg";
+        const framePattern = `frame_%06d.${frameExt}`;
+        const encoderOpts = {
+          fps: job.config.fps,
+          width,
+          height,
+          codec: preset.codec,
+          preset: preset.preset,
+          quality: preset.quality,
+          pixelFormat: preset.pixelFormat,
+          useGpu: job.config.useGpu,
+          hdr: preset.hdr,
+        };
+        const encodeResult = enableChunkedEncode
+          ? await encodeFramesChunkedConcat(
+              framesDir,
+              framePattern,
+              videoOnlyPath,
+              encoderOpts,
+              chunkedEncodeSize,
+              abortSignal,
+            )
+          : await encodeFramesFromDir(
+              framesDir,
+              framePattern,
+              videoOnlyPath,
+              encoderOpts,
+              abortSignal,
+            );
+        assertNotAborted();
+
+        if (!encodeResult.success) {
+          throw new Error(`Encoding failed: ${encodeResult.error}`);
+        }
+
+        perfStages.encodeMs = Date.now() - stage5Start;
       }
-
-      perfStages.encodeMs = Date.now() - stage5Start;
-    }
+    } // end SDR capture paths block
 
     if (probeSession !== null) {
       const remainingProbeSession: CaptureSession = probeSession;

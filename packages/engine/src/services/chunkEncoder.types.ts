@@ -1,3 +1,5 @@
+import type { HdrTransfer } from "../utils/hdr.js";
+
 export interface EncoderOptions {
   fps: number;
   width: number;
@@ -8,6 +10,7 @@ export interface EncoderOptions {
   bitrate?: string;
   pixelFormat?: string;
   useGpu?: boolean;
+  hdr?: { transfer: HdrTransfer };
 }
 
 export interface EncodeResult {

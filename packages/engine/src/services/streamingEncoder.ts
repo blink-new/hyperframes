@@ -79,6 +79,9 @@ export interface StreamingEncoderOptions {
   pixelFormat?: string;
   useGpu?: boolean;
   imageFormat?: "jpeg" | "png";
+  hdr?: { transfer: import("../utils/hdr.js").HdrTransfer };
+  /** When set, use rawvideo input instead of image2pipe. For HDR PQ-encoded frames. */
+  rawInputFormat?: "rgb48le";
 }
 
 export interface StreamingEncoderResult {
@@ -116,19 +119,26 @@ function buildStreamingArgs(
   } = options;
 
   // Input args: pipe from stdin
-  const inputCodec = imageFormat === "png" ? "png" : "mjpeg";
-  const args: string[] = [
-    "-f",
-    "image2pipe",
-    "-vcodec",
-    inputCodec,
-    "-framerate",
-    String(fps),
-    "-i",
-    "-",
-    "-r",
-    String(fps),
-  ];
+  const args: string[] = [];
+  if (options.rawInputFormat) {
+    // Raw pixel input (HDR PQ-encoded rgb48le)
+    args.push(
+      "-f",
+      "rawvideo",
+      "-pix_fmt",
+      options.rawInputFormat,
+      "-s",
+      `${options.width}x${options.height}`,
+      "-framerate",
+      String(fps),
+      "-i",
+      "-",
+    );
+  } else {
+    const inputCodec = imageFormat === "png" ? "png" : "mjpeg";
+    args.push("-f", "image2pipe", "-vcodec", inputCodec, "-framerate", String(fps), "-i", "-");
+  }
+  args.push("-r", String(fps));
 
   const shouldUseGpu = useGpu && gpuEncoder !== null;
 
@@ -169,15 +179,20 @@ function buildStreamingArgs(
       if (bitrate) args.push("-b:v", bitrate);
       else args.push("-crf", String(quality));
 
-      // Encoder-specific params: anti-banding + bt709 color space.
-      // aq-mode=3 redistributes bits to dark flat areas (gradients).
-      // colorprim/transfer/colormatrix embed bt709 in the H.264/H.265 VUI.
+      // Encoder-specific params: anti-banding + color space tagging.
       const xParamsFlag = codec === "h264" ? "-x264-params" : "-x265-params";
-      const colorParams = "colorprim=bt709:transfer=bt709:colormatrix=bt709";
+      const colorParams =
+        options.rawInputFormat && options.hdr
+          ? `colorprim=bt2020:transfer=${options.hdr.transfer === "pq" ? "smpte2084" : "arib-std-b67"}:colormatrix=bt2020nc`
+          : "colorprim=bt709:transfer=bt709:colormatrix=bt709";
       if (preset === "ultrafast") {
         args.push(xParamsFlag, `aq-mode=3:${colorParams}`);
       } else {
         args.push(xParamsFlag, `aq-mode=3:aq-strength=0.8:deblock=1,1:${colorParams}`);
+      }
+      // Apple devices require hvc1 tag for HEVC playback (default hev1 won't open in QuickTime)
+      if (codec === "h265") {
+        args.push("-tag:v", "hvc1");
       }
     }
   } else if (codec === "vp9") {
@@ -194,27 +209,47 @@ function buildStreamingArgs(
     return [...args, "-y", outputPath];
   }
 
-  // BT.709 color space metadata — Chrome screenshots are sRGB which maps to bt709.
-  // Tags the output so players interpret colors correctly across devices.
+  // Color space metadata.
+  // When rawInputFormat is set, data comes from the WebGPU HDR pipeline
+  // (PQ-encoded) — tag with bt2020/PQ truthfully.
+  // Otherwise, Chrome captures sRGB — tag as bt709.
   if (codec === "h264" || codec === "h265") {
-    args.push(
-      "-colorspace:v",
-      "bt709",
-      "-color_primaries:v",
-      "bt709",
-      "-color_trc:v",
-      "bt709",
-      "-color_range",
-      "tv",
-    );
+    if (options.rawInputFormat && options.hdr) {
+      args.push(
+        "-colorspace:v",
+        "bt2020nc",
+        "-color_primaries:v",
+        "bt2020",
+        "-color_trc:v",
+        options.hdr.transfer === "pq" ? "smpte2084" : "arib-std-b67",
+        "-color_range",
+        "tv",
+      );
+    } else {
+      args.push(
+        "-colorspace:v",
+        "bt709",
+        "-color_primaries:v",
+        "bt709",
+        "-color_trc:v",
+        "bt709",
+        "-color_range",
+        "tv",
+      );
+    }
 
-    // Convert full-range RGB input (Chrome screenshots) to limited/TV range for H.264.
-    if (gpuEncoder === "vaapi") {
+    // Video filter for range/color conversion.
+    // Raw HDR input (from WebGPU pipeline) is already PQ-encoded — no conversion needed.
+    // Chrome screenshots need full→TV range conversion.
+    if (options.rawInputFormat) {
+      // No filter needed — PQ data goes straight to encoder
+    } else if (gpuEncoder === "vaapi") {
       const vfIdx = args.indexOf("-vf");
       if (vfIdx !== -1) {
         args[vfIdx + 1] = `scale=in_range=pc:out_range=tv,${args[vfIdx + 1]}`;
       }
     } else if (!shouldUseGpu) {
+      // Range conversion: Chrome screenshots are full-range RGB.
       args.push("-vf", "scale=in_range=pc:out_range=tv");
     }
 

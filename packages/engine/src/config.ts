@@ -52,6 +52,12 @@ export interface EngineConfig {
   /** Timeout for FFmpeg streaming encode (ms). Default: 600_000 */
   ffmpegStreamingTimeout: number;
 
+  // ── HDR ──────────────────────────────────────────────────────────────
+  /** HDR output transfer function. false = SDR output (default). */
+  hdr: { transfer: "hlg" | "pq" } | false;
+  /** Auto-detect HDR from video sources when hdr is not explicitly set. */
+  hdrAutoDetect: boolean;
+
   // ── Media ────────────────────────────────────────────────────────────
   audioGain: number;
   frameDataUriCacheLimit: number;
@@ -95,6 +101,9 @@ export const DEFAULT_CONFIG: EngineConfig = {
   ffmpegEncodeTimeout: 600_000,
   ffmpegProcessTimeout: 300_000,
   ffmpegStreamingTimeout: 600_000,
+
+  hdr: false,
+  hdrAutoDetect: true,
 
   audioGain: 1.35,
   frameDataUriCacheLimit: 256,
@@ -169,6 +178,13 @@ export function resolveConfig(overrides?: Partial<EngineConfig>): EngineConfig {
       "FFMPEG_STREAMING_TIMEOUT_MS",
       DEFAULT_CONFIG.ffmpegStreamingTimeout,
     ),
+
+    hdr: (() => {
+      const raw = env("PRODUCER_HDR_TRANSFER");
+      if (raw === "hlg" || raw === "pq") return { transfer: raw };
+      return undefined;
+    })(),
+    hdrAutoDetect: envBool("PRODUCER_HDR_AUTO_DETECT", DEFAULT_CONFIG.hdrAutoDetect),
 
     audioGain: envNum("PRODUCER_AUDIO_GAIN", DEFAULT_CONFIG.audioGain),
     frameDataUriCacheLimit: Math.max(

@@ -9,11 +9,8 @@ import { spawn } from "child_process";
 import { existsSync, mkdirSync, readdirSync, rmSync } from "fs";
 import { join } from "path";
 import { parseHTML } from "linkedom";
-import {
-  extractVideoMetadata,
-  type VideoMetadata,
-  type VideoColorSpace,
-} from "../utils/ffprobe.js";
+import { extractVideoMetadata, type VideoMetadata } from "../utils/ffprobe.js";
+import { isHdrColorSpace as isHdrColorSpaceUtil } from "../utils/hdr.js";
 import { downloadToTemp, isHttpUrl } from "../utils/urlDownloader.js";
 import { runFfmpeg } from "../utils/runFfmpeg.js";
 import { DEFAULT_CONFIG, type EngineConfig } from "../config.js";
@@ -119,18 +116,28 @@ export async function extractVideoFramesRange(
   const framePattern = `frame_%05d.${format}`;
   const outputPattern = join(videoOutputDir, framePattern);
 
-  const args: string[] = [
-    "-ss",
-    String(startTime),
-    "-i",
-    videoPath,
-    "-t",
-    String(duration),
-    "-vf",
-    `fps=${fps}`,
-    "-q:v",
-    format === "jpg" ? String(Math.ceil((100 - quality) / 3)) : "0",
-  ];
+  // When extracting from HDR source, tone-map to SDR in FFmpeg rather than
+  // letting Chrome's uncontrollable tone-mapper handle it (which washes out).
+  // macOS: VideoToolbox hardware decoder does HDR→SDR natively on Apple Silicon.
+  // Linux: zscale filter (when available) or colorspace filter as fallback.
+  const isHdr = isHdrColorSpaceUtil(metadata.colorSpace);
+  const isMacOS = process.platform === "darwin";
+
+  const args: string[] = [];
+  if (isHdr && isMacOS) {
+    args.push("-hwaccel", "videotoolbox");
+  }
+  args.push("-ss", String(startTime), "-i", videoPath, "-t", String(duration));
+
+  const vfFilters: string[] = [];
+  if (isHdr && isMacOS) {
+    // VideoToolbox tone-maps during decode; force output to bt709 SDR format
+    vfFilters.push("format=nv12");
+  }
+  vfFilters.push(`fps=${fps}`);
+  args.push("-vf", vfFilters.join(","));
+
+  args.push("-q:v", format === "jpg" ? String(Math.ceil((100 - quality) / 3)) : "0");
   if (format === "png") args.push("-compression_level", "6");
   args.push("-y", outputPattern);
 
@@ -202,16 +209,9 @@ export async function extractVideoFramesRange(
 
 /**
  * Check if a video's color space indicates HDR content (BT.2020 primaries/matrix/transfer).
+ * Re-exported from utils/hdr.ts for backward compatibility.
  */
-export function isHdrColorSpace(cs: VideoColorSpace | null): boolean {
-  if (!cs) return false;
-  return (
-    cs.colorPrimaries.includes("bt2020") ||
-    cs.colorSpace.includes("bt2020") ||
-    cs.colorTransfer === "smpte2084" ||
-    cs.colorTransfer === "arib-std-b67"
-  );
-}
+export const isHdrColorSpace = isHdrColorSpaceUtil;
 
 /**
  * Convert an SDR video to HDR color space (HLG / BT.2020) so it can be
@@ -224,20 +224,16 @@ export function isHdrColorSpace(cs: VideoColorSpace | null): boolean {
 async function convertSdrToHdr(
   inputPath: string,
   outputPath: string,
-  inputColorSpace: VideoColorSpace | null,
   signal?: AbortSignal,
   config?: Partial<Pick<EngineConfig, "ffmpegProcessTimeout">>,
 ): Promise<void> {
   const timeout = config?.ffmpegProcessTimeout ?? DEFAULT_CONFIG.ffmpegProcessTimeout;
-  const tin = inputColorSpace?.colorTransfer || "bt709";
-  const min = inputColorSpace?.colorSpace || "bt709";
-  const pin = inputColorSpace?.colorPrimaries || "bt709";
 
   const args = [
     "-i",
     inputPath,
     "-vf",
-    `zscale=tin=${tin}:min=${min}:pin=${pin}:t=arib-std-b67:m=bt2020nc:p=bt2020:r=tv:npl=600`,
+    "colorspace=all=bt2020:iall=bt709:range=tv",
     "-color_primaries",
     "bt2020",
     "-color_trc",
@@ -327,7 +323,7 @@ export async function extractAllVideoFrames(
         if (!entry) continue;
         const convertedPath = join(convertDir, `${entry.video.id}_hdr.mp4`);
         try {
-          await convertSdrToHdr(entry.videoPath, convertedPath, cs, signal, config);
+          await convertSdrToHdr(entry.videoPath, convertedPath, signal, config);
           entry.videoPath = convertedPath;
         } catch (err) {
           errors.push({

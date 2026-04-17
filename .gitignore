@@ -14,12 +14,6 @@ dist/
 .DS_Store
 Thumbs.db
 
-# Docs media — served from CDN, not committed.
-# Regenerate with scripts/generate-{catalog,template}-previews.ts then upload
-# with `bun run upload:docs-images`. Add explicit negations below for any
-# non-generated assets (logos, svgs) that should stay in the repo.
-docs/images/
-
 # IDE
 .vscode/
 .idea/
@@ -53,28 +47,9 @@ packages/producer/src/services/fontData.generated.ts
 
 # Test artifacts
 my-video/
-examples/
 packages/studio/data/
 .desloppify/
 .worktrees/
 
-# Playwright MCP browser cache
-.playwright-mcp/
-
-# Installed skills (user-specific)
-.agents/
-.claude/skills/
-skills-lock.json
-
-# Skills from other PRs (not managed here)
-skills/hyperframes-animation-map/
-skills/hyperframes-contrast/
-
-# Capture outputs
-captures/
-# Legacy test captures at repo root (use captures/ instead)
-*-capture/
-*-demo/
-*-ad/
-*-tour/
-*-brand/
+# Git worktrees
+.worktrees/

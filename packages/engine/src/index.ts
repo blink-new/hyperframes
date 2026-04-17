@@ -153,3 +153,23 @@ export {
 } from "./utils/ffprobe.js";
 
 export { downloadToTemp, isHttpUrl } from "./utils/urlDownloader.js";
+
+export {
+  initHdrReadback,
+  uploadAndReadbackHdrFrame,
+  convertHdrFrameToRgb48le,
+  float16ToPqRgb,
+  buildHdrChromeArgs,
+  launchHdrBrowser,
+} from "./services/hdrCapture.js";
+
+export {
+  isHdrColorSpace,
+  detectTransfer,
+  getHdrEncoderColorParams,
+  analyzeCompositionHdr,
+  type HdrTransfer,
+  type HdrEncoderColorParams,
+  type CompositionHdrInfo,
+} from "./utils/hdr.js";
+export type { VideoColorSpace } from "./utils/ffprobe.js";

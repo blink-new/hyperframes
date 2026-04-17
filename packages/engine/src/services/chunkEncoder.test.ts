@@ -247,3 +247,91 @@ describe("buildEncoderArgs color space", () => {
     expect(args).not.toContain("-video_track_timescale");
   });
 });
+
+describe("getEncoderPreset HDR", () => {
+  it("returns h265 with 10-bit for HDR HLG", () => {
+    const preset = getEncoderPreset("standard", "mp4", { transfer: "hlg" });
+    expect(preset.codec).toBe("h265");
+    expect(preset.pixelFormat).toBe("yuv420p10le");
+    expect(preset.hdr).toEqual({ transfer: "hlg" });
+  });
+
+  it("returns h265 with 10-bit for HDR PQ", () => {
+    const preset = getEncoderPreset("high", "mp4", { transfer: "pq" });
+    expect(preset.codec).toBe("h265");
+    expect(preset.pixelFormat).toBe("yuv420p10le");
+    expect(preset.hdr).toEqual({ transfer: "pq" });
+  });
+
+  it("avoids ultrafast preset for HDR (upgrades to fast)", () => {
+    const preset = getEncoderPreset("draft", "mp4", { transfer: "hlg" });
+    expect(preset.preset).toBe("fast");
+  });
+
+  it("ignores HDR for webm format", () => {
+    const preset = getEncoderPreset("standard", "webm", { transfer: "hlg" });
+    expect(preset.codec).toBe("vp9");
+    expect(preset.hdr).toBeUndefined();
+  });
+
+  it("ignores HDR for mov format", () => {
+    const preset = getEncoderPreset("standard", "mov", { transfer: "pq" });
+    expect(preset.codec).toBe("prores");
+    expect(preset.hdr).toBeUndefined();
+  });
+});
+
+describe("buildEncoderArgs HDR color space", () => {
+  const baseOptions = { fps: 30, width: 1920, height: 1080 };
+  const inputArgs = ["-framerate", "30", "-i", "frames/%04d.png"];
+
+  it("uses bt709 color tags for HDR output (Chrome captures sRGB)", () => {
+    // HDR flag gives H.265 + 10-bit encoding but pixels are still sRGB/bt709.
+    // Tagging as bt2020 causes orange shift — so we tag truthfully as bt709.
+    const args = buildEncoderArgs(
+      { ...baseOptions, codec: "h265", preset: "medium", quality: 23, hdr: { transfer: "hlg" } },
+      inputArgs,
+      "out.mp4",
+    );
+    expect(args[args.indexOf("-colorspace:v") + 1]).toBe("bt709");
+    expect(args[args.indexOf("-color_primaries:v") + 1]).toBe("bt709");
+    expect(args[args.indexOf("-color_trc:v") + 1]).toBe("bt709");
+    const paramIdx = args.indexOf("-x265-params");
+    expect(args[paramIdx + 1]).toContain("colorprim=bt709");
+    expect(args[paramIdx + 1]).toContain("transfer=bt709");
+  });
+
+  it("uses bt709 when HDR is not set", () => {
+    const args = buildEncoderArgs(
+      { ...baseOptions, codec: "h265", preset: "medium", quality: 23 },
+      inputArgs,
+      "out.mp4",
+    );
+    expect(args[args.indexOf("-colorspace:v") + 1]).toBe("bt709");
+    expect(args[args.indexOf("-color_trc:v") + 1]).toBe("bt709");
+  });
+
+  it("uses range conversion (not colorspace) for HDR CPU encoding", () => {
+    // Chrome screenshots are sRGB — we don't convert primaries (causes color shifts).
+    // Just range-convert and let the bt2020 container metadata + 10-bit handle the rest.
+    const args = buildEncoderArgs(
+      { ...baseOptions, codec: "h265", preset: "medium", quality: 23, hdr: { transfer: "hlg" } },
+      inputArgs,
+      "out.mp4",
+    );
+    const vfIdx = args.indexOf("-vf");
+    expect(vfIdx).toBeGreaterThan(-1);
+    expect(args[vfIdx + 1]).toContain("scale=in_range=pc:out_range=tv");
+    expect(args[vfIdx + 1]).not.toContain("colorspace");
+  });
+
+  it("uses same range conversion for SDR CPU encoding", () => {
+    const args = buildEncoderArgs(
+      { ...baseOptions, codec: "h264", preset: "medium", quality: 23 },
+      inputArgs,
+      "out.mp4",
+    );
+    const vfIdx = args.indexOf("-vf");
+    expect(args[vfIdx + 1]).toContain("scale=in_range=pc:out_range=tv");
+  });
+});

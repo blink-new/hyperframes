@@ -10,6 +10,7 @@ import { copyFileSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSy
 import { join, dirname } from "path";
 import { DEFAULT_CONFIG, type EngineConfig } from "../config.js";
 import { type GpuEncoder, getCachedGpuEncoder, getGpuEncoderName } from "../utils/gpuEncoder.js";
+import { type HdrTransfer } from "../utils/hdr.js";
 import { runFfmpeg } from "../utils/runFfmpeg.js";
 import type { EncoderOptions, EncodeResult, MuxResult } from "./chunkEncoder.types.js";
 
@@ -21,15 +22,24 @@ export const ENCODER_PRESETS = {
   high: { preset: "slow", quality: 15, codec: "h264" as const },
 };
 
+export interface EncoderPreset {
+  preset: string;
+  quality: number;
+  codec: "h264" | "h265" | "vp9" | "prores";
+  pixelFormat: string;
+  hdr?: { transfer: HdrTransfer };
+}
+
 /**
  * Get encoder preset for a given quality and output format.
- * WebM uses VP9 with alpha-capable pixel format; MP4 uses h264;
+ * WebM uses VP9 with alpha-capable pixel format; MP4 uses h264 (or h265 for HDR);
  * MOV uses ProRes 4444 with alpha for editor-compatible transparency.
  */
 export function getEncoderPreset(
   quality: "draft" | "standard" | "high",
   format: "mp4" | "webm" | "mov" = "mp4",
-): { preset: string; quality: number; codec: "h264" | "vp9" | "prores"; pixelFormat: string } {
+  hdr?: { transfer: HdrTransfer },
+): EncoderPreset {
   const base = ENCODER_PRESETS[quality];
   if (format === "webm") {
     return {
@@ -45,6 +55,15 @@ export function getEncoderPreset(
       quality: base.quality,
       codec: "prores",
       pixelFormat: "yuva444p10le",
+    };
+  }
+  if (hdr) {
+    return {
+      preset: base.preset === "ultrafast" ? "fast" : base.preset,
+      quality: base.quality,
+      codec: "h265",
+      pixelFormat: "yuv420p10le",
+      hdr,
     };
   }
   return { ...base, pixelFormat: "yuv420p" };
@@ -109,9 +128,8 @@ export function buildEncoderArgs(
       if (bitrate) args.push("-b:v", bitrate);
       else args.push("-crf", String(quality));
 
-      // Encoder-specific params: anti-banding + bt709 color space.
+      // Encoder-specific params: anti-banding + color space tagging.
       // aq-mode=3 redistributes bits to dark flat areas (gradients).
-      // colorprim/transfer/colormatrix embed bt709 in the H.264/H.265 VUI.
       const xParamsFlag = codec === "h264" ? "-x264-params" : "-x265-params";
       const colorParams = "colorprim=bt709:transfer=bt709:colormatrix=bt709";
       if (preset === "ultrafast") {
@@ -119,6 +137,10 @@ export function buildEncoderArgs(
       } else {
         args.push(xParamsFlag, `aq-mode=3:aq-strength=0.8:deblock=1,1:${colorParams}`);
       }
+    }
+    // Apple devices require hvc1 tag for HEVC playback (default hev1 won't open in QuickTime)
+    if (codec === "h265") {
+      args.push("-tag:v", "hvc1");
     }
   } else if (codec === "vp9") {
     args.push("-c:v", "libvpx-vp9", "-b:v", bitrate || "0", "-crf", String(quality));
@@ -134,8 +156,12 @@ export function buildEncoderArgs(
     return [...args, "-y", outputPath];
   }
 
-  // BT.709 color space metadata — Chrome screenshots are sRGB which maps to bt709.
-  // Tags the output so players interpret colors correctly across devices.
+  // Color space metadata — tags the output so players interpret colors correctly.
+  // Chrome screenshots are always sRGB/bt709 pixels regardless of --hdr flag.
+  // We tag truthfully as bt709 even for HDR output — the --hdr flag gives
+  // H.265 + 10-bit encoding (better quality/compression) without lying about
+  // the color space. Tagging as bt2020 when pixels are bt709 causes browsers
+  // to apply the wrong color transform, producing visible orange/warm shifts.
   if (codec === "h264" || codec === "h265") {
     args.push(
       "-colorspace:v",
@@ -148,15 +174,15 @@ export function buildEncoderArgs(
       "tv",
     );
 
-    // Convert full-range RGB input (Chrome screenshots) to limited/TV range for H.264.
-    // VAAPI already has a -vf chain for hwupload; prepend range conversion to it.
+    // Range conversion: Chrome's full-range RGB → limited/TV range.
     if (gpuEncoder === "vaapi") {
-      // Replace the existing VAAPI -vf with one that includes range conversion
       const vfIdx = args.indexOf("-vf");
       if (vfIdx !== -1) {
         args[vfIdx + 1] = `scale=in_range=pc:out_range=tv,${args[vfIdx + 1]}`;
       }
     } else if (!shouldUseGpu) {
+      // Range conversion: Chrome screenshots are full-range RGB.
+      // The scale filter handles both 8-bit and 10-bit correctly.
       args.push("-vf", "scale=in_range=pc:out_range=tv");
     }
 
