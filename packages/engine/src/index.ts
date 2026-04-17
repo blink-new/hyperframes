@@ -77,6 +77,8 @@ export {
   injectVideoFramesBatch,
   syncVideoFrameVisibility,
   cdpSessionCache,
+  initTransparentBackground,
+  captureAlphaPng,
   type BeginFrameResult,
 } from "./services/screenshotService.js";
 
@@ -154,14 +156,24 @@ export {
 
 export { downloadToTemp, isHttpUrl } from "./utils/urlDownloader.js";
 
+export { decodePng, decodePngToRgb48le, blitRgba8OverRgb48le } from "./utils/alphaBlit.js";
+
 export {
   initHdrReadback,
   uploadAndReadbackHdrFrame,
-  convertHdrFrameToRgb48le,
   float16ToPqRgb,
   buildHdrChromeArgs,
   launchHdrBrowser,
 } from "./services/hdrCapture.js";
+
+export { captureScreenshotWithAlpha } from "./services/screenshotService.js";
+
+export {
+  hideVideoElements,
+  showVideoElements,
+  queryVideoElementBounds,
+  type VideoElementBounds,
+} from "./services/videoFrameInjector.js";
 
 export {
   isHdrColorSpace,

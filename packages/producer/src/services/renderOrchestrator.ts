@@ -55,8 +55,16 @@ import {
   spawnStreamingEncoder,
   createFrameReorderBuffer,
   type StreamingEncoder,
-  convertHdrFrameToRgb48le,
   isHdrColorSpace,
+  extractVideoMetadata,
+  initTransparentBackground,
+  captureAlphaPng,
+  decodePng,
+  decodePngToRgb48le,
+  blitRgba8OverRgb48le,
+  hideVideoElements,
+  showVideoElements,
+  queryVideoElementBounds,
 } from "@hyperframes/engine";
 import { join, dirname, resolve } from "path";
 import { randomUUID } from "crypto";
@@ -699,6 +707,29 @@ export async function executeRenderJob(
     const compiledDir = join(workDir, "compiled");
     let extractionResult: Awaited<ReturnType<typeof extractAllVideoFrames>> | null = null;
 
+    // Probe ORIGINAL color spaces before extraction (which may convert SDR→HDR).
+    // This is needed to identify which videos are natively HDR vs converted-SDR
+    // for the two-pass compositing path.
+    const nativeHdrVideoIds = new Set<string>();
+    if (composition.videos.length > 0) {
+      await Promise.all(
+        composition.videos.map(async (v) => {
+          let videoPath = v.src;
+          if (!videoPath.startsWith("/")) {
+            const fromCompiled = existsSync(join(compiledDir, videoPath))
+              ? join(compiledDir, videoPath)
+              : join(projectDir, videoPath);
+            videoPath = fromCompiled;
+          }
+          if (!existsSync(videoPath)) return;
+          const meta = await extractVideoMetadata(videoPath);
+          if (isHdrColorSpace(meta.colorSpace)) {
+            nativeHdrVideoIds.add(v.id);
+          }
+        }),
+      );
+    }
+
     if (composition.videos.length > 0) {
       extractionResult = await extractAllVideoFrames(
         composition.videos,
@@ -713,7 +744,6 @@ export async function executeRenderJob(
       if (extractionResult.extracted.length > 0) {
         frameLookup = createFrameLookupTable(composition.videos, extractionResult.extracted);
       }
-
       perfStages.videoExtractMs = Date.now() - stage2Start;
 
       // Auto-detect audio from video files via ffprobe metadata
@@ -831,17 +861,56 @@ export async function executeRenderJob(
 
     job.framesRendered = 0;
 
-    // ── HDR pass-through path ────────────────────────────────────────────
-    // When HDR output is requested AND the composition has HDR video sources,
-    // extract raw HLG frames and pass them directly to FFmpeg — no conversion.
-    // The HLG pixel values ARE the correct encoding. The output is tagged as
-    // HLG/BT.2020 so HDR displays render it correctly.
+    // ── HDR two-pass compositing path ────────────────────────────────────
+    // Pass 1: Capture DOM layer with alpha (Chrome, video elements hidden)
+    // Pass 2: Extract native HLG frames from video sources (FFmpeg)
+    // Composite: overlay DOM on top of HDR video in FFmpeg per-frame
     //
-    // No WebGPU or Chrome needed for this path — it's a pure FFmpeg pipeline.
-    // GSAP transforms are NOT applied (future work: WebGPU shader transforms).
+    // This preserves HDR luminance from video sources while correctly
+    // compositing DOM content (text, graphics, SDR overlays) on top.
+    // GSAP-animated video position/opacity is applied via queried bounds.
     if (hasHdrVideo) {
-      log.info("[Render] HDR pass-through: extracting native HLG frames from video sources");
+      log.info("[Render] HDR two-pass: DOM layer + native HLG video compositing");
 
+      // Use NATIVE HDR IDs (probed before SDR→HDR conversion) so only originally-HDR
+      // videos are hidden + extracted natively. SDR videos stay in the DOM screenshot
+      // (injected via the frame injector) and get sRGB→HLG conversion in the blit.
+      const hdrVideoIds = composition.videos
+        .filter((v) => nativeHdrVideoIds.has(v.id))
+        .map((v) => v.id);
+
+      // Resolve HDR video source paths
+      const hdrVideoSrcPaths = new Map<string, string>();
+      for (const v of composition.videos) {
+        if (!hdrVideoIds.includes(v.id)) continue;
+        let srcPath = v.src;
+        if (!srcPath.startsWith("/")) {
+          const fromCompiled = join(compiledDir, srcPath);
+          srcPath = existsSync(fromCompiled) ? fromCompiled : join(projectDir, srcPath);
+        }
+        hdrVideoSrcPaths.set(v.id, srcPath);
+      }
+
+      // Launch headless Chrome for DOM capture.
+      // Pass the video frame injector so SDR videos are rendered correctly in Chrome.
+      // HDR videos get injected too but are hidden via hideVideoElements before the
+      // DOM screenshot — only the native FFmpeg-extracted HLG frames are used for HDR.
+      const domSession = await createCaptureSession(
+        fileServer!.url,
+        framesDir,
+        captureOptions,
+        createVideoFrameInjector(frameLookup),
+        cfg,
+      );
+      await initializeSession(domSession);
+      assertNotAborted();
+      lastBrowserConsole = domSession.browserConsoleBuffer;
+
+      // Set transparent background once for this dedicated DOM session.
+      // captureAlphaPng() per frame skips the per-frame CDP set/reset overhead.
+      await initTransparentBackground(domSession.page);
+
+      // Spawn HDR streaming encoder accepting raw rgb48le composited frames
       const hdrEncoder = await spawnStreamingEncoder(
         videoOnlyPath,
         {
@@ -862,45 +931,97 @@ export async function executeRenderJob(
 
       const { execSync } = await import("child_process");
 
+      // ── Pre-extract all HDR video frames in a single FFmpeg pass ──────
+      // Per-frame `-ss` fast seek causes duplicate frames at keyframe boundaries.
+      // A single extraction pass decodes sequentially — every frame is unique.
+      const hdrFrameDirs = new Map<string, string>();
+      for (const [videoId, srcPath] of hdrVideoSrcPaths) {
+        const video = composition.videos.find((v) => v.id === videoId);
+        if (!video) continue;
+        const frameDir = join(framesDir, `hdr_${videoId}`);
+        mkdirSync(frameDir, { recursive: true });
+        const duration = video.end - video.start;
+        try {
+          execSync(
+            `ffmpeg -ss ${video.mediaStart} -i "${srcPath}" -t ${duration} -r ${job.config.fps} ` +
+              `-vf "scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}" ` +
+              `-pix_fmt rgb48le -c:v png "${join(frameDir, "frame_%04d.png")}"`,
+            { maxBuffer: 1024 * 1024, stdio: ["pipe", "pipe", "pipe"] },
+          );
+        } catch {
+          // If extraction fails, frames won't exist — loop handles gracefully
+        }
+        hdrFrameDirs.set(videoId, frameDir);
+      }
+      assertNotAborted();
+
       try {
+        // The beforeCaptureHook injects SDR video frames into the DOM.
+        // We call it manually since the HDR loop doesn't use captureFrame().
+        const beforeCaptureHook = domSession.onBeforeCapture;
+
         for (let i = 0; i < job.totalFrames!; i++) {
           assertNotAborted();
           const time = i / job.config.fps;
 
-          const activeFrames = frameLookup!.getActiveFramePayloads(time);
+          // Seek timeline
+          await domSession.page.evaluate((t: number) => {
+            if (window.__hf && typeof window.__hf.seek === "function") window.__hf.seek(t);
+          }, time);
 
-          if (activeFrames.size > 0) {
-            const [videoId] = activeFrames.keys();
-            const video = composition.videos.find((v) => v.id === videoId);
-            if (video) {
-              const localTime = time - video.start + video.mediaStart;
+          // Inject SDR video frames into the DOM (the hook handles all videos,
+          // but hideVideoElements below will hide the HDR ones before screenshot)
+          if (beforeCaptureHook) {
+            await beforeCaptureHook(domSession.page, time);
+          }
 
-              let srcPath = video.src;
-              const compiledDir = join(workDir, "compiled");
-              if (!srcPath.startsWith("/")) {
-                const fromCompiled = join(compiledDir, srcPath);
-                srcPath = existsSync(fromCompiled) ? fromCompiled : join(projectDir, srcPath);
-              }
+          // Query video element positions BEFORE hiding (so GSAP has already moved them)
+          const bounds = await queryVideoElementBounds(domSession.page, hdrVideoIds);
+          const activeBounds = bounds.filter((b) => b.visible);
 
-              let rawFrame: Buffer;
+          // Pass 1: Hide HDR videos (and their injected frames), capture DOM with alpha.
+          // SDR video frames remain visible in the screenshot.
+          await hideVideoElements(domSession.page, hdrVideoIds);
+          const domPng = await captureAlphaPng(domSession.page, width, height);
+          await showVideoElements(domSession.page, hdrVideoIds);
+
+          // Pass 2: Read pre-extracted HDR frame and composite with DOM layer
+          const activeVideoId = activeBounds[0]?.videoId ?? hdrVideoIds[0];
+          const video = composition.videos.find((v) => v.id === activeVideoId);
+          const frameDir = activeVideoId ? hdrFrameDirs.get(activeVideoId) : undefined;
+
+          let composited: Buffer;
+          if (video && frameDir) {
+            // Frame index within the video (1-based for FFmpeg image2 output)
+            const videoFrameIndex = Math.round((time - video.start) * job.config.fps) + 1;
+            const framePath = join(
+              frameDir,
+              `frame_${String(videoFrameIndex).padStart(4, "0")}.png`,
+            );
+
+            let hdrRgb: Buffer;
+            if (existsSync(framePath)) {
               try {
-                rawFrame = execSync(
-                  `ffmpeg -ss ${localTime} -i "${srcPath}" -vframes 1 -f rawvideo -pix_fmt rgba64le -`,
-                  { maxBuffer: width * height * 8 + 1024 * 1024, stdio: ["pipe", "pipe", "pipe"] },
-                );
+                hdrRgb = decodePngToRgb48le(readFileSync(framePath)).data;
               } catch {
-                rawFrame = Buffer.alloc(width * height * 8);
+                hdrRgb = Buffer.alloc(width * height * 6);
               }
-
-              // Pass through HLG pixels as-is (RGBA → RGB, no color conversion)
-              const rgb48Frame = convertHdrFrameToRgb48le(rawFrame, width, height);
-              hdrEncoder.writeFrame(rgb48Frame);
             } else {
-              hdrEncoder.writeFrame(Buffer.alloc(width * height * 6));
+              hdrRgb = Buffer.alloc(width * height * 6);
+            }
+
+            // In-memory alpha composite: DOM PNG over HDR rgb48le
+            try {
+              const { data: domRgba } = decodePng(domPng);
+              composited = blitRgba8OverRgb48le(domRgba, hdrRgb, width, height);
+            } catch {
+              composited = hdrRgb;
             }
           } else {
-            hdrEncoder.writeFrame(Buffer.alloc(width * height * 6));
+            composited = Buffer.alloc(width * height * 6);
           }
+
+          hdrEncoder.writeFrame(composited);
 
           job.framesRendered = i + 1;
           if ((i + 1) % 10 === 0 || i + 1 === job.totalFrames!) {
@@ -908,14 +1029,15 @@ export async function executeRenderJob(
             updateJobStatus(
               job,
               "rendering",
-              `HDR frame ${i + 1}/${job.totalFrames}`,
+              `HDR composite frame ${i + 1}/${job.totalFrames}`,
               Math.round(25 + frameProgress * 55),
               onProgress,
             );
           }
         }
       } finally {
-        // No browser to close — pure FFmpeg path
+        lastBrowserConsole = domSession.browserConsoleBuffer;
+        await closeCaptureSession(domSession);
       }
 
       const hdrEncodeResult = await hdrEncoder.close();

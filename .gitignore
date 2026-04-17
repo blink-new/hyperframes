@@ -29,7 +29,13 @@ packages/producer/tests/*/failures/
 
 # Rendered output (not test fixtures — those use git LFS)
 output/
+renders/
 !packages/producer/tests/*/output/
+
+# Composition source media (large binaries)
+compositions/**/*.mp4
+compositions/**/*.mov
+compositions/**/*.MOV
 
 # npm pack artifacts
 *.tgz

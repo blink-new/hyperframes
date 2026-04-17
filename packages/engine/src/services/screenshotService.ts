@@ -133,6 +133,78 @@ export async function pageScreenshotCapture(page: Page, options: CaptureOptions)
   return Buffer.from(result.data, "base64");
 }
 
+/**
+ * Capture a screenshot with transparent background (PNG + alpha channel).
+ *
+ * Used in the two-pass HDR compositing pipeline — captures DOM content
+ * (text, graphics, SDR overlays) with transparency where the background shows,
+ * so it can be overlaid on top of native HDR video frames in FFmpeg.
+ *
+ * Sets and restores the background color override on every call. For sessions
+ * that capture many frames, prefer calling initTransparentBackground() once
+ * at session init, then captureAlphaPng() per frame to avoid the 2× CDP
+ * round-trip overhead.
+ */
+export async function captureScreenshotWithAlpha(
+  page: Page,
+  width: number,
+  height: number,
+): Promise<Buffer> {
+  const client = await getCdpSession(page);
+  // Force transparent background so the screenshot has a real alpha channel
+  await client.send("Emulation.setDefaultBackgroundColorOverride", {
+    color: { r: 0, g: 0, b: 0, a: 0 },
+  });
+  const result = await client.send("Page.captureScreenshot", {
+    format: "png",
+    fromSurface: true,
+    captureBeyondViewport: false,
+    optimizeForSpeed: false, // must be false to preserve alpha
+    clip: { x: 0, y: 0, width, height, scale: 1 },
+  });
+  // Restore opaque background for subsequent captures
+  await client.send("Emulation.setDefaultBackgroundColorOverride", {});
+  return Buffer.from(result.data, "base64");
+}
+
+/**
+ * Set the page background to transparent once for a dedicated HDR DOM session.
+ *
+ * Call this once after session initialization. Then use captureAlphaPng() per
+ * frame instead of captureScreenshotWithAlpha() to skip the per-frame CDP
+ * background override round-trips.
+ *
+ * Only use on sessions that are exclusively dedicated to transparent capture
+ * (e.g., the HDR two-pass DOM layer session) — the background will stay
+ * transparent for the lifetime of the session.
+ */
+export async function initTransparentBackground(page: Page): Promise<void> {
+  const client = await getCdpSession(page);
+  await client.send("Emulation.setDefaultBackgroundColorOverride", {
+    color: { r: 0, g: 0, b: 0, a: 0 },
+  });
+}
+
+/**
+ * Capture a transparent-background PNG screenshot without setting the
+ * background color override. Requires initTransparentBackground() to have
+ * been called once on this session.
+ *
+ * Faster than captureScreenshotWithAlpha() for per-frame use in the HDR
+ * two-pass compositing loop.
+ */
+export async function captureAlphaPng(page: Page, width: number, height: number): Promise<Buffer> {
+  const client = await getCdpSession(page);
+  const result = await client.send("Page.captureScreenshot", {
+    format: "png",
+    fromSurface: true,
+    captureBeyondViewport: false,
+    optimizeForSpeed: false, // must be false to preserve alpha
+    clip: { x: 0, y: 0, width, height, scale: 1 },
+  });
+  return Buffer.from(result.data, "base64");
+}
+
 export async function injectVideoFramesBatch(
   page: Page,
   updates: Array<{ videoId: string; dataUri: string }>,
