@@ -236,9 +236,14 @@ export interface ElementStackingInfo {
   y: number;
   width: number;
   height: number;
+  /** Layout dimensions before CSS transforms (offsetWidth/offsetHeight). */
+  layoutWidth: number;
+  layoutHeight: number;
   opacity: number;
   visible: boolean;
   isHdr: boolean;
+  transform: string; // CSS transform matrix string, e.g. "matrix(1,0,0,1,0,0)" or "none"
+  borderRadius: [number, number, number, number]; // [tl, tr, br, bl] in CSS px from nearest clipping ancestor
 }
 
 /**
@@ -274,18 +279,121 @@ export async function queryElementStacking(
       return 0;
     }
 
+    // Find border-radius that clips the element. Replaced elements like <video>
+    // clip to their own border-radius; ancestors need overflow !== visible.
+    function getEffectiveBorderRadius(node: Element): [number, number, number, number] {
+      // Resolve a CSS border-radius value to pixels. Chrome's getComputedStyle
+      // returns percentages as-is (e.g. "50%"), not resolved to px.
+      // Uses offsetWidth/offsetHeight (layout dimensions before CSS transforms)
+      // because CSS resolves percentages against the padding box, not the
+      // transformed bounding box.
+      function resolveRadius(value: string, el: Element): number {
+        if (value.includes("%")) {
+          const pct = parseFloat(value) / 100;
+          const htmlEl = el as HTMLElement;
+          const w = htmlEl.offsetWidth || 0;
+          const h = htmlEl.offsetHeight || 0;
+          return pct * Math.min(w, h);
+        }
+        return parseFloat(value) || 0;
+      }
+
+      // Check element itself (replaced elements clip to own border-radius)
+      const selfCs = window.getComputedStyle(node);
+      const selfRadii: [number, number, number, number] = [
+        resolveRadius(selfCs.borderTopLeftRadius, node),
+        resolveRadius(selfCs.borderTopRightRadius, node),
+        resolveRadius(selfCs.borderBottomRightRadius, node),
+        resolveRadius(selfCs.borderBottomLeftRadius, node),
+      ];
+      if (selfRadii[0] > 0 || selfRadii[1] > 0 || selfRadii[2] > 0 || selfRadii[3] > 0) {
+        return selfRadii;
+      }
+
+      // Walk ancestors looking for clipping container
+      let current: Element | null = node.parentElement;
+      while (current) {
+        const cs = window.getComputedStyle(current);
+        if (cs.overflow !== "visible") {
+          const tl = resolveRadius(cs.borderTopLeftRadius, current);
+          const tr = resolveRadius(cs.borderTopRightRadius, current);
+          const brr = resolveRadius(cs.borderBottomRightRadius, current);
+          const bl = resolveRadius(cs.borderBottomLeftRadius, current);
+          if (tl > 0 || tr > 0 || brr > 0 || bl > 0) {
+            return [tl, tr, brr, bl];
+          }
+        }
+        current = current.parentElement;
+      }
+      return [0, 0, 0, 0];
+    }
+
+    // Walk up the DOM multiplying each ancestor's opacity. GSAP animates
+    // opacity on wrapper divs, not directly on the video element, so the
+    // element's own opacity is often 1.0. Multiplying ancestors gives the
+    // true effective opacity.
+    function getEffectiveOpacity(node: Element): number {
+      let opacity = 1;
+      let current: Element | null = node;
+      while (current) {
+        const cs = window.getComputedStyle(current);
+        const val = parseFloat(cs.opacity);
+        // Note: `val || 1` would turn opacity:0 into 1 (0 is falsy)
+        opacity *= Number.isNaN(val) ? 1 : val;
+        current = current.parentElement;
+      }
+      return opacity;
+    }
+
+    // Compute the full CSS transform matrix from element-local coords to
+    // viewport coords by walking the offsetParent chain and accumulating
+    // position offsets + CSS transforms. This correctly handles GSAP
+    // animations on wrapper divs (rotation, scale) that getBoundingClientRect
+    // conflates into an axis-aligned bounding box.
+    function getViewportMatrix(node: Element): string {
+      const chain: HTMLElement[] = [];
+      let current: Element | null = node;
+      while (current instanceof HTMLElement) {
+        chain.push(current);
+        current = current.offsetParent as Element | null;
+      }
+      let mat = new DOMMatrix();
+      for (let i = chain.length - 1; i >= 0; i--) {
+        const htmlEl = chain[i];
+        if (!htmlEl) continue;
+        mat = mat.translate(htmlEl.offsetLeft, htmlEl.offsetTop);
+        const cs = window.getComputedStyle(htmlEl);
+        if (cs.transform && cs.transform !== "none") {
+          // Chrome's computed matrix does NOT include transform-origin.
+          // CSS applies transforms as: translate(origin) * M * translate(-origin).
+          // Parse the origin (defaults to "50% 50%") and wrap the matrix.
+          const origin = cs.transformOrigin.split(" ");
+          const ox = parseFloat(origin[0] || "0");
+          const oy = parseFloat(origin[1] || "0");
+          mat = mat.translate(ox, oy).multiply(new DOMMatrix(cs.transform)).translate(-ox, -oy);
+        }
+      }
+      return mat.toString();
+    }
+
     for (const el of elements) {
       const id = el.id;
       if (!id) continue;
       const rect = el.getBoundingClientRect();
       const style = window.getComputedStyle(el);
       const zIndex = getEffectiveZIndex(el);
-      const opacity = parseFloat(style.opacity) || 1;
+      // For HDR video elements, the frame injector sets `opacity: 0 !important`
+      // on the element itself. Start the opacity walk from the parent to get the
+      // real GSAP-animated opacity from wrapper divs.
+      const isHdrEl = hdrSet.has(id);
+      const opacityStartNode = isHdrEl ? el.parentElement : el;
+      const opacity = opacityStartNode ? getEffectiveOpacity(opacityStartNode) : 1;
       const visible =
         style.visibility !== "hidden" &&
         style.display !== "none" &&
         rect.width > 0 &&
         rect.height > 0;
+      const htmlEl = el as HTMLElement;
       results.push({
         id,
         zIndex,
@@ -293,9 +401,16 @@ export async function queryElementStacking(
         y: Math.round(rect.y),
         width: Math.round(rect.width),
         height: Math.round(rect.height),
+        layoutWidth: htmlEl.offsetWidth || Math.round(rect.width),
+        layoutHeight: htmlEl.offsetHeight || Math.round(rect.height),
         opacity,
         visible,
         isHdr: hdrSet.has(id),
+        // For HDR elements, use the full accumulated viewport matrix so the
+        // affine blit can apply rotation/scale/translate properly. For DOM
+        // elements, the element-level transform is sufficient for reference.
+        transform: isHdrEl ? getViewportMatrix(el) : style.transform || "none",
+        borderRadius: isHdrEl ? getEffectiveBorderRadius(el) : [0, 0, 0, 0],
       });
     }
     return results;

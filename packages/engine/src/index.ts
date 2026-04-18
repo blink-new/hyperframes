@@ -161,6 +161,8 @@ export {
   decodePngToRgb48le,
   blitRgba8OverRgb48le,
   blitRgb48leRegion,
+  blitRgb48leAffine,
+  parseTransformMatrix,
   getSrgbToHdrLut,
 } from "./utils/alphaBlit.js";
 
