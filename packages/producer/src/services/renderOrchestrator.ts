@@ -29,6 +29,7 @@ import {
   extractAllVideoFrames,
   createFrameLookupTable,
   type VideoElement,
+  type ImageElement,
   FrameLookupTable,
   type HdrTransfer,
   detectTransfer,
@@ -217,6 +218,7 @@ export interface CompositionMetadata {
   duration: number;
   videos: VideoElement[];
   audios: AudioElement[];
+  images: ImageElement[];
   width: number;
   height: number;
 }
@@ -594,6 +596,7 @@ export async function executeRenderJob(
       duration: compiled.staticDuration,
       videos: compiled.videos,
       audios: compiled.audios,
+      images: compiled.images,
       width: compiled.width,
       height: compiled.height,
     };
@@ -861,6 +864,27 @@ export async function executeRenderJob(
       );
     }
 
+    // Probe images for HDR color space (also gated by --hdr)
+    if (job.config.hdr && composition.images.length > 0) {
+      await Promise.all(
+        composition.images.map(async (img) => {
+          let imgPath = img.src;
+          if (!imgPath.startsWith("/")) {
+            const fromCompiled = existsSync(join(compiledDir, imgPath))
+              ? join(compiledDir, imgPath)
+              : join(projectDir, imgPath);
+            imgPath = fromCompiled;
+          }
+          if (!existsSync(imgPath)) return;
+          const meta = await extractVideoMetadata(imgPath);
+          if (isHdrColorSpace(meta.colorSpace)) {
+            nativeHdrVideoIds.add(img.id);
+            videoTransfers.set(img.id, detectTransfer(meta.colorSpace));
+          }
+        }),
+      );
+    }
+
     if (composition.videos.length > 0) {
       extractionResult = await extractAllVideoFrames(
         composition.videos,
@@ -869,6 +893,10 @@ export async function executeRenderJob(
         abortSignal,
         undefined,
         compiledDir,
+        // Skip SDR→HDR conversion when HDR compositing will handle it in the blit step.
+        // convertSdrToHdr produces bt2020 pixels that Chrome misinterprets as sRGB,
+        // making SDR content invisible.
+        nativeHdrVideoIds.size > 0,
       );
       assertNotAborted();
 
@@ -1111,6 +1139,11 @@ export async function executeRenderJob(
           hdrVideoStartTimes.set(v.id, v.start);
         }
       }
+      for (const img of composition.images) {
+        if (nativeHdrVideoIds.has(img.id)) {
+          hdrVideoStartTimes.set(img.id, img.start);
+        }
+      }
 
       // Collect unique start times to minimize seek operations
       const uniqueStartTimes = [...new Set(hdrVideoStartTimes.values())].sort((a, b) => a - b);
@@ -1171,6 +1204,42 @@ export async function executeRenderJob(
           );
         }
         hdrFrameDirs.set(videoId, frameDir);
+      }
+
+      // ── Extract HDR images as single-frame 16-bit PNGs ───────────────
+      for (const img of composition.images) {
+        if (!nativeHdrVideoIds.has(img.id)) continue;
+        let imgPath = img.src;
+        if (!imgPath.startsWith("/")) {
+          const fromCompiled = join(compiledDir, imgPath);
+          imgPath = existsSync(fromCompiled) ? fromCompiled : join(projectDir, imgPath);
+        }
+        const frameDir = join(framesDir, `hdr_${img.id}`);
+        mkdirSync(frameDir, { recursive: true });
+        const dims = hdrExtractionDims.get(img.id) ?? { width, height };
+        const imgResult = await runFfmpeg(
+          [
+            "-i",
+            imgPath,
+            "-frames:v",
+            "1",
+            "-vf",
+            `scale=${dims.width}:${dims.height}:force_original_aspect_ratio=increase,crop=${dims.width}:${dims.height}`,
+            "-pix_fmt",
+            "rgb48le",
+            "-c:v",
+            "png",
+            "-y",
+            join(frameDir, "frame_0001.png"),
+          ],
+          { signal: abortSignal },
+        );
+        if (!imgResult.success) {
+          log.debug(`HDR image extraction failed for ${img.id}`, {
+            error: imgResult.stderr.slice(-200),
+          });
+        }
+        hdrFrameDirs.set(img.id, frameDir);
       }
 
       assertNotAborted();

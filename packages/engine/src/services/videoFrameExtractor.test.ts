@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseVideoElements, isHdrColorSpace } from "./videoFrameExtractor.js";
-import type { VideoColorSpace } from "../utils/ffprobe.js";
+import { parseVideoElements, parseImageElements, isHdrColorSpace } from "./videoFrameExtractor.js";
 
 describe("parseVideoElements", () => {
   it("parses videos without an id or data-start attribute", () => {
@@ -34,53 +33,38 @@ describe("parseVideoElements", () => {
   });
 });
 
-describe("isHdrColorSpace", () => {
-  it("returns false for null color space", () => {
+describe("parseImageElements", () => {
+  it("parses img elements with data-start and data-duration", () => {
+    const html = `<div><img id="i1" src="photo.jpg" data-start="2" data-duration="5" /></div>`;
+    const images = parseImageElements(html);
+    expect(images).toHaveLength(1);
+    expect(images[0]).toEqual({ id: "i1", src: "photo.jpg", start: 2, end: 7 });
+  });
+
+  it("skips img without data-duration", () => {
+    const html = `<div><img id="i1" src="photo.jpg" data-start="0" /></div>`;
+    const images = parseImageElements(html);
+    expect(images).toHaveLength(0);
+  });
+
+  it("generates stable IDs for img without id attribute", () => {
+    const html = `<div><img src="a.jpg" data-start="0" data-duration="3" /><img src="b.jpg" data-start="1" data-duration="2" /></div>`;
+    const images = parseImageElements(html);
+    expect(images).toHaveLength(2);
+    expect(images[0].id).toBe("hf-img-0");
+    expect(images[1].id).toBe("hf-img-1");
+  });
+});
+
+describe("isHdrColorSpace re-export", () => {
+  it("delegates to utils/hdr (full suite lives in hdr.test.ts)", () => {
     expect(isHdrColorSpace(null)).toBe(false);
-  });
-
-  it("returns false for SDR bt709", () => {
-    const sdr: VideoColorSpace = {
-      colorTransfer: "bt709",
-      colorPrimaries: "bt709",
-      colorSpace: "bt709",
-    };
-    expect(isHdrColorSpace(sdr)).toBe(false);
-  });
-
-  it("detects HDR via bt2020 primaries", () => {
-    const hdr: VideoColorSpace = {
-      colorTransfer: "bt709",
-      colorPrimaries: "bt2020",
-      colorSpace: "bt709",
-    };
-    expect(isHdrColorSpace(hdr)).toBe(true);
-  });
-
-  it("detects HDR via bt2020nc color space", () => {
-    const hdr: VideoColorSpace = {
-      colorTransfer: "bt709",
-      colorPrimaries: "bt709",
-      colorSpace: "bt2020nc",
-    };
-    expect(isHdrColorSpace(hdr)).toBe(true);
-  });
-
-  it("detects HDR via smpte2084 (PQ) transfer", () => {
-    const hdr: VideoColorSpace = {
-      colorTransfer: "smpte2084",
-      colorPrimaries: "bt2020",
-      colorSpace: "bt2020nc",
-    };
-    expect(isHdrColorSpace(hdr)).toBe(true);
-  });
-
-  it("detects HDR via arib-std-b67 (HLG) transfer", () => {
-    const hdr: VideoColorSpace = {
-      colorTransfer: "arib-std-b67",
-      colorPrimaries: "bt2020",
-      colorSpace: "bt2020nc",
-    };
-    expect(isHdrColorSpace(hdr)).toBe(true);
+    expect(
+      isHdrColorSpace({
+        colorTransfer: "smpte2084",
+        colorPrimaries: "bt2020",
+        colorSpace: "bt2020nc",
+      }),
+    ).toBe(true);
   });
 });

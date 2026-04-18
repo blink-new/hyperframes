@@ -27,6 +27,8 @@ import { extractVideoMetadata, extractAudioMetadata } from "../utils/ffprobe.js"
 import {
   parseVideoElements,
   type VideoElement,
+  parseImageElements,
+  type ImageElement,
   parseAudioElements,
   type AudioElement,
   analyzeKeyframeIntervals,
@@ -40,6 +42,7 @@ export interface CompiledComposition {
   subCompositions: Map<string, string>;
   videos: VideoElement[];
   audios: AudioElement[];
+  images: ImageElement[];
   unresolvedCompositions: UnresolvedElement[];
   /** Assets that resolve outside projectDir. Keys are the path used in HTML, values are absolute filesystem paths. */
   externalAssets: Map<string, string>;
@@ -924,12 +927,14 @@ export async function compileForRender(
   // Parse main HTML elements
   const mainVideos = parseVideoElements(html);
   const mainAudios = parseAudioElements(html);
+  const mainImages = parseImageElements(html);
 
   // Keep inlined sub-composition media authoritative on ID collisions.
   // inlineSubCompositions() hoists those nodes into the final HTML, so the
   // producer should follow the same precedence the runtime sees in the merged DOM.
   const videos = dedupeElementsById([...mainVideos, ...subVideos]);
   const audios = dedupeElementsById([...mainAudios, ...subAudios]);
+  const images = dedupeElementsById(mainImages);
 
   // Advisory video checks (sparse keyframes, VFR). Fire-and-forget — these spawn
   // ffprobe subprocesses and should not block compilation since they only produce warnings.
@@ -976,6 +981,7 @@ export async function compileForRender(
     subCompositions,
     videos,
     audios,
+    images,
     unresolvedCompositions,
     externalAssets,
     width,

@@ -113,6 +113,8 @@ export {
   createFrameLookupTable,
   FrameLookupTable,
   type VideoElement,
+  parseImageElements,
+  type ImageElement,
   type ExtractedFrames,
   type ExtractionOptions,
   type ExtractionResult,
