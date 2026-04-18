@@ -176,13 +176,14 @@ const HF_BRIDGE_SCRIPT = `(function() {
     if (!p || typeof p.renderSeek !== "function" || typeof p.getDuration !== "function") {
       return false;
     }
-    window.__hf = {
+    var existing = window.__hf || {};
+    window.__hf = Object.assign(existing, {
       get duration() {
         var d = p.getDuration();
         return d > 0 ? d : getDeclaredDuration();
       },
       seek: function(t) { p.renderSeek(t); },
-    };
+    });
     return true;
   }
   if (bridge()) return;
