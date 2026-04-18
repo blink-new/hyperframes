@@ -156,7 +156,15 @@ export {
 
 export { downloadToTemp, isHttpUrl } from "./utils/urlDownloader.js";
 
-export { decodePng, decodePngToRgb48le, blitRgba8OverRgb48le } from "./utils/alphaBlit.js";
+export {
+  decodePng,
+  decodePngToRgb48le,
+  blitRgba8OverRgb48le,
+  blitRgb48leRegion,
+  getSrgbToHdrLut,
+} from "./utils/alphaBlit.js";
+
+export { groupIntoLayers, type CompositeLayer } from "./utils/layerCompositor.js";
 
 export {
   initHdrReadback,
@@ -172,7 +180,9 @@ export {
   hideVideoElements,
   showVideoElements,
   queryVideoElementBounds,
+  queryElementStacking,
   type VideoElementBounds,
+  type ElementStackingInfo,
 } from "./services/videoFrameInjector.js";
 
 export {

@@ -225,3 +225,79 @@ export async function queryVideoElementBounds(
     });
   }, videoIds);
 }
+
+/**
+ * Stacking info for a single timed element, used by the z-ordered layer compositor.
+ */
+export interface ElementStackingInfo {
+  id: string;
+  zIndex: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  opacity: number;
+  visible: boolean;
+  isHdr: boolean;
+}
+
+/**
+ * Query Chrome for ALL timed elements' stacking context.
+ * Returns z-index, bounds, opacity, and whether each element is a native HDR video.
+ *
+ * Queries every element with `data-start` (not just videos) so the layer compositor
+ * can determine z-ordering between DOM content and HDR video elements.
+ */
+export async function queryElementStacking(
+  page: Page,
+  nativeHdrVideoIds: Set<string>,
+): Promise<ElementStackingInfo[]> {
+  const hdrIds = Array.from(nativeHdrVideoIds);
+  return page.evaluate((hdrIdList: string[]): ElementStackingInfo[] => {
+    const hdrSet = new Set(hdrIdList);
+    const elements = document.querySelectorAll("[data-start]");
+    const results: ElementStackingInfo[] = [];
+
+    // Walk up the DOM to find the effective z-index from the nearest
+    // positioned ancestor with a z-index. CSS z-index only applies to
+    // positioned elements; video elements inside positioned wrappers
+    // inherit the wrapper's stacking context.
+    function getEffectiveZIndex(node: Element): number {
+      let current: Element | null = node;
+      while (current) {
+        const cs = window.getComputedStyle(current);
+        const pos = cs.position;
+        const z = parseInt(cs.zIndex);
+        if (!Number.isNaN(z) && pos !== "static") return z;
+        current = current.parentElement;
+      }
+      return 0;
+    }
+
+    for (const el of elements) {
+      const id = el.id;
+      if (!id) continue;
+      const rect = el.getBoundingClientRect();
+      const style = window.getComputedStyle(el);
+      const zIndex = getEffectiveZIndex(el);
+      const opacity = parseFloat(style.opacity) || 1;
+      const visible =
+        style.visibility !== "hidden" &&
+        style.display !== "none" &&
+        rect.width > 0 &&
+        rect.height > 0;
+      results.push({
+        id,
+        zIndex,
+        x: Math.round(rect.x),
+        y: Math.round(rect.y),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+        opacity,
+        visible,
+        isHdr: hdrSet.has(id),
+      });
+    }
+    return results;
+  }, hdrIds);
+}
