@@ -92,20 +92,17 @@ export async function initHdrReadback(page: Page, width: number, height: number)
         usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
       });
 
-      const uploadBytesPerRow = Math.ceil((w * bytesPerPixel) / 256) * 256;
-
       const captureRuntime = {
         device,
         renderTexture,
         readBuffer,
         bytesPerRow,
-        uploadBytesPerRow,
         width: w,
         height: h,
 
         /**
          * Upload pre-converted float16 RGBA data and read it back.
-         * The float16 data must be row-aligned to uploadBytesPerRow.
+         * The float16 data must be row-aligned to bytesPerRow.
          *
          * Input: base64-encoded Uint16Array (float16 RGBA, row-padded)
          * Output: base64-encoded readback of the same texture
@@ -122,7 +119,7 @@ export async function initHdrReadback(page: Page, width: number, height: number)
           device.queue.writeTexture(
             { texture: renderTexture },
             bytes.buffer,
-            { bytesPerRow: uploadBytesPerRow, rowsPerImage: h },
+            { bytesPerRow, rowsPerImage: h },
             [w, h],
           );
 

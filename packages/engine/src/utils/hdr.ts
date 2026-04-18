@@ -45,13 +45,12 @@ export interface HdrEncoderColorParams {
  */
 export function getHdrEncoderColorParams(transfer: HdrTransfer): HdrEncoderColorParams {
   const colorTrc = transfer === "pq" ? "smpte2084" : "arib-std-b67";
-  const transferParam = transfer === "pq" ? "smpte2084" : "arib-std-b67";
   return {
     colorPrimaries: "bt2020",
     colorTrc,
     colorspace: "bt2020nc",
     pixelFormat: "yuv420p10le",
-    x265ColorParams: `colorprim=bt2020:transfer=${transferParam}:colormatrix=bt2020nc`,
+    x265ColorParams: `colorprim=bt2020:transfer=${colorTrc}:colormatrix=bt2020nc`,
   };
 }
 
