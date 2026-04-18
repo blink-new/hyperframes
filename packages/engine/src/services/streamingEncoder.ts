@@ -121,7 +121,13 @@ function buildStreamingArgs(
   // Input args: pipe from stdin
   const args: string[] = [];
   if (options.rawInputFormat) {
-    // Raw pixel input (HDR PQ-encoded rgb48le)
+    // Raw pixel input (HLG/PQ-encoded rgb48le from FFmpeg extraction).
+    // Tag the input with the correct color space so FFmpeg uses the right
+    // YUV matrix when converting rgb48le → yuv420p10le for encoding.
+    // Without these tags FFmpeg assumes bt709 and applies the wrong matrix.
+    const hdrTransfer = options.hdr?.transfer;
+    const inputColorTrc =
+      hdrTransfer === "pq" ? "smpte2084" : hdrTransfer === "hlg" ? "arib-std-b67" : undefined;
     args.push(
       "-f",
       "rawvideo",
@@ -131,9 +137,18 @@ function buildStreamingArgs(
       `${options.width}x${options.height}`,
       "-framerate",
       String(fps),
-      "-i",
-      "-",
     );
+    if (inputColorTrc) {
+      args.push(
+        "-color_primaries",
+        "bt2020",
+        "-color_trc",
+        inputColorTrc,
+        "-colorspace",
+        "bt2020nc",
+      );
+    }
+    args.push("-i", "-");
   } else {
     const inputCodec = imageFormat === "png" ? "png" : "mjpeg";
     args.push("-f", "image2pipe", "-vcodec", inputCodec, "-framerate", String(fps), "-i", "-");
@@ -339,7 +354,13 @@ export async function spawnStreamingEncoder(
       if (exitStatus !== "running" || !ffmpeg.stdin || ffmpeg.stdin.destroyed) {
         return false;
       }
-      return ffmpeg.stdin.write(buffer);
+      // Copy the buffer before writing — Node streams hold a reference to the
+      // provided buffer and drain it asynchronously. If the caller reuses the
+      // buffer (e.g. zero-filling transOutput for the next transition frame),
+      // the pipe would read partially-overwritten data, causing horizontal
+      // banding artifacts that flicker frame-to-frame.
+      const copy = Buffer.from(buffer);
+      return ffmpeg.stdin.write(copy);
     },
 
     close: async (): Promise<StreamingEncoderResult> => {
@@ -347,9 +368,10 @@ export async function spawnStreamingEncoder(
       if (signal) signal.removeEventListener("abort", onAbort);
 
       // Close stdin to signal end of input
-      if (ffmpeg.stdin && !ffmpeg.stdin.destroyed) {
+      const stdin = ffmpeg.stdin;
+      if (stdin && !stdin.destroyed) {
         await new Promise<void>((resolve) => {
-          ffmpeg.stdin!.end(() => resolve());
+          stdin.end(() => resolve());
         });
       }
 
