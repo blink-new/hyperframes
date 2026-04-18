@@ -7,10 +7,9 @@ export const examples: Example[] = [
   ["Render transparent overlay (ProRes)", "hyperframes render --format mov --output overlay.mov"],
   ["Render transparent WebM overlay", "hyperframes render --format webm --output overlay.webm"],
   ["High quality at 60fps", "hyperframes render --fps 60 --quality high --output hd.mp4"],
-  ["Custom CRF for maximum quality", "hyperframes render --crf 15 --output pristine.mp4"],
-  ["Target bitrate encoding", "hyperframes render --video-bitrate 10M --output hq.mp4"],
   ["Deterministic render via Docker", "hyperframes render --docker --output deterministic.mp4"],
   ["Parallel rendering with 6 workers", "hyperframes render --workers 6 --output fast.mp4"],
+  ["HDR output (H.265 10-bit)", "hyperframes render --hdr --output hdr-output.mp4"],
 ];
 import { cpus, freemem, tmpdir } from "node:os";
 import { resolve, dirname, join, basename } from "node:path";
@@ -81,19 +80,10 @@ export default defineCommand({
       description: "Use Docker for deterministic render",
       default: false,
     },
-    crf: {
-      type: "string",
-      description:
-        "CRF (Constant Rate Factor) for the video encoder. " +
-        "Lower = higher quality / larger file. Range: 0–51 for H.264. " +
-        "Overrides the quality preset CRF. Cannot be used with --video-bitrate.",
-    },
-    "video-bitrate": {
-      type: "string",
-      description:
-        "Target video bitrate (e.g. '10M', '5000k'). " +
-        "Uses bitrate-based encoding instead of CRF. " +
-        "Cannot be used with --crf.",
+    hdr: {
+      type: "boolean",
+      description: "Enable HDR: probe sources for PQ/HLG, output H.265 10-bit BT.2020",
+      default: false,
     },
     gpu: { type: "boolean", description: "Use GPU encoding", default: false },
     quiet: {
@@ -143,36 +133,6 @@ export default defineCommand({
       process.exit(1);
     }
     const format = formatRaw as "mp4" | "webm" | "mov";
-
-    // ── Validate CRF / video-bitrate ────────────────────────────────────
-    let crf: number | undefined;
-    let videoBitrate: string | undefined;
-    if (args.crf != null && args["video-bitrate"] != null) {
-      errorBox(
-        "Conflicting options",
-        "--crf and --video-bitrate cannot be used together. Choose one.",
-      );
-      process.exit(1);
-    }
-    if (args.crf != null) {
-      const parsed = parseInt(args.crf, 10);
-      if (isNaN(parsed) || parsed < 0 || parsed > 51) {
-        errorBox("Invalid CRF", `Got "${args.crf}". Must be a number between 0 and 51.`);
-        process.exit(1);
-      }
-      crf = parsed;
-    }
-    if (args["video-bitrate"] != null) {
-      const raw = args["video-bitrate"];
-      if (!/^\d+(\.\d+)?[kKM]$/.test(raw)) {
-        errorBox(
-          "Invalid video bitrate",
-          `Got "${raw}". Must be a number followed by k, K, or M (e.g. "10M", "5000k", "1.5M").`,
-        );
-        process.exit(1);
-      }
-      videoBitrate = raw;
-    }
 
     // ── Validate workers ──────────────────────────────────────────────────
     let workers: number | undefined;
@@ -231,12 +191,7 @@ export default defineCommand({
           c.accent(project.name) +
           c.dim(" \u2192 " + outputPath),
       );
-      const encodeLabel = videoBitrate
-        ? `bitrate ${videoBitrate}`
-        : crf != null
-          ? `crf ${crf}`
-          : quality;
-      console.log(c.dim("   " + fps + "fps \u00B7 " + encodeLabel + " \u00B7 " + workerLabel));
+      console.log(c.dim("   " + fps + "fps \u00B7 " + quality + " \u00B7 " + workerLabel));
       console.log("");
     }
 
@@ -316,9 +271,8 @@ export default defineCommand({
         format,
         workers: workerCount,
         gpu: useGpu,
+        hdr: args.hdr ?? false,
         quiet,
-        crf,
-        videoBitrate,
       });
     } else {
       await renderLocal(project.dir, outputPath, {
@@ -327,10 +281,9 @@ export default defineCommand({
         format,
         workers: workerCount,
         gpu: useGpu,
+        hdr: args.hdr ?? false,
         quiet,
         browserPath,
-        crf,
-        videoBitrate,
       });
     }
   },
@@ -342,10 +295,9 @@ interface RenderOptions {
   format: "mp4" | "webm" | "mov";
   workers: number;
   gpu: boolean;
+  hdr: boolean;
   quiet: boolean;
   browserPath?: string;
-  crf?: number;
-  videoBitrate?: string;
 }
 
 const DOCKER_IMAGE_PREFIX = "hyperframes-renderer";
@@ -480,8 +432,6 @@ async function renderDocker(
     String(options.workers),
     ...(options.quiet ? ["--quiet"] : []),
     ...(options.gpu ? ["--gpu"] : []),
-    ...(options.crf != null ? ["--crf", String(options.crf)] : []),
-    ...(options.videoBitrate ? ["--video-bitrate", options.videoBitrate] : []),
   ];
 
   if (!options.quiet) {
@@ -543,8 +493,7 @@ async function renderLocal(
     format: options.format,
     workers: options.workers,
     useGpu: options.gpu,
-    crf: options.crf,
-    videoBitrate: options.videoBitrate,
+    hdr: options.hdr,
   });
 
   const onProgress = options.quiet

@@ -82,6 +82,8 @@ export const mediaRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = 
     const timedTagPositions: Array<{ name: string; start: number; id?: string }> = [];
     for (const tag of tags) {
       if (tag.name === "video" || tag.name === "audio") continue;
+      // Skip the composition root — it uses data-start as a playback anchor, not as a clip timer
+      if (readAttr(tag.raw, "data-composition-id")) continue;
       if (readAttr(tag.raw, "data-start")) {
         timedTagPositions.push({
           name: tag.name,

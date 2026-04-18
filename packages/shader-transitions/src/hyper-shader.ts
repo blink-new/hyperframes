@@ -83,6 +83,18 @@ function deriveAccentColors(hex: string): AccentColors {
 export function init(config: HyperShaderConfig): GsapTimeline {
   const { bgColor, scenes, transitions } = config;
 
+  // Expose transition metadata for the HDR compositing orchestrator
+  if (typeof window !== "undefined" && (window as any).__hf) {
+    (window as any).__hf.transitions = transitions.map((t: TransitionConfig, i: number) => ({
+      time: t.time,
+      duration: t.duration ?? 1,
+      shader: t.shader,
+      ease: t.ease ?? "none",
+      fromScene: scenes[i],
+      toScene: scenes[i + 1],
+    }));
+  }
+
   const accentColors: AccentColors = config.accentColor
     ? deriveAccentColors(config.accentColor)
     : { accent: [1, 0.6, 0.2], dark: [0.4, 0.15, 0], bright: [1, 0.85, 0.5] };

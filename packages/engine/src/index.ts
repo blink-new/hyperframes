@@ -155,6 +155,7 @@ export {
 } from "./utils/ffprobe.js";
 
 export { downloadToTemp, isHttpUrl } from "./utils/urlDownloader.js";
+export { runFfmpeg, type RunFfmpegOptions, type RunFfmpegResult } from "./utils/runFfmpeg.js";
 
 export {
   decodePng,
@@ -164,9 +165,21 @@ export {
   blitRgb48leAffine,
   parseTransformMatrix,
   getSrgbToHdrLut,
+  roundedRectAlpha,
 } from "./utils/alphaBlit.js";
 
 export { groupIntoLayers, type CompositeLayer } from "./utils/layerCompositor.js";
+
+// ── Shader transitions ────────────────────────────────────────────────────────
+export {
+  type TransitionFn,
+  TRANSITIONS,
+  crossfade,
+  sampleRgb48le,
+  hdrToLinear,
+  linearToHdr,
+  convertTransfer,
+} from "./utils/shaderTransitions.js";
 
 export {
   initHdrReadback,
