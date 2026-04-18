@@ -232,16 +232,11 @@ export async function injectVideoFramesBatch(
         }
         if (!img) continue;
 
-        if (!sourceIsStatic) {
-          img.style.position = computedStyle.position;
-          img.style.width = computedStyle.width;
-          img.style.height = computedStyle.height;
-          img.style.top = computedStyle.top;
-          img.style.left = computedStyle.left;
-          img.style.right = computedStyle.right;
-          img.style.bottom = computedStyle.bottom;
-          img.style.inset = computedStyle.inset;
-        } else {
+        // Always use absolute positioning so the <img> overlays the <video>
+        // instead of flowing below it. With position:relative, both elements
+        // stack vertically — the <img> lands below the video and gets clipped
+        // by any overflow:hidden ancestor (e.g., border-radius wrappers).
+        {
           const videoRect = video.getBoundingClientRect();
           const offsetLeft = Number.isFinite(video.offsetLeft) ? video.offsetLeft : 0;
           const offsetTop = Number.isFinite(video.offsetTop) ? video.offsetTop : 0;
@@ -307,14 +302,25 @@ export async function syncVideoFrameVisibility(
     const active = new Set(ids);
     const videos = Array.from(document.querySelectorAll("video[data-start]")) as HTMLVideoElement[];
     for (const video of videos) {
-      if (active.has(video.id)) continue;
-      video.style.removeProperty("display");
-      video.style.setProperty("visibility", "hidden", "important");
-      video.style.setProperty("opacity", "0", "important");
-      video.style.setProperty("pointer-events", "none", "important");
       const img = video.nextElementSibling as HTMLElement | null;
-      if (img && img.classList.contains("__render_frame__")) {
-        img.style.visibility = "hidden";
+      const hasImg = img && img.classList.contains("__render_frame__");
+      if (active.has(video.id)) {
+        // Active video: show injected <img>, hide native <video>
+        video.style.setProperty("visibility", "hidden", "important");
+        video.style.setProperty("opacity", "0", "important");
+        video.style.setProperty("pointer-events", "none", "important");
+        if (hasImg) {
+          img.style.visibility = "visible";
+        }
+      } else {
+        // Inactive video: hide both
+        video.style.removeProperty("display");
+        video.style.setProperty("visibility", "hidden", "important");
+        video.style.setProperty("opacity", "0", "important");
+        video.style.setProperty("pointer-events", "none", "important");
+        if (hasImg) {
+          img.style.visibility = "hidden";
+        }
       }
     }
   }, activeVideoIds);
